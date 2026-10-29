@@ -1,4 +1,4 @@
-"""Выполнение действий мышью и клавиатурой в окне AnyDesk."""
+"""Мышь и клавиатура в окне AnyDesk."""
 
 from __future__ import annotations
 
@@ -13,8 +13,7 @@ WHEEL_NOTCH = 120 if sys.platform == "win32" else 1
 
 
 class Controller:
-    def __init__(self, typing: str = "clipboard", dry_run: bool = False):
-        self.typing = typing
+    def __init__(self, dry_run: bool = False):
         self.dry_run = dry_run
         self._gui = None
 
@@ -29,7 +28,8 @@ class Controller:
             self._gui = pyautogui
         return self._gui
 
-    def execute(self, a: Action, frame: Frame) -> str:
+    def execute(self, a: Action, frame: Frame | None) -> str:
+        """Выполняет GUI-действие. Координаты действия — в пикселях кадра frame."""
         if self.dry_run:
             return "dry-run: not executed"
         g = self.gui
@@ -52,43 +52,52 @@ class Controller:
                 g.scroll(WHEEL_NOTCH if a.amount > 0 else -WHEEL_NOTCH)
                 time.sleep(0.03)
         elif a.type == "type":
-            self.type_text(a.text)
+            self.paste(a.text)
             if a.enter:
                 time.sleep(0.2)
                 g.press("enter")
         elif a.type == "key":
-            if len(a.keys) == 1:
-                g.press(a.keys[0])
-            else:
-                g.hotkey(*a.keys, interval=0.05)
-        elif a.type == "open_terminal":
-            self.open_terminal(a.shell, a.admin)
-        elif a.type == "wait":
-            time.sleep(a.seconds)
+            self.hotkey(*a.keys)
         else:
             raise ValueError(f"Controller can't execute {a.type}")
         return "ok"
 
-    def type_text(self, text: str) -> None:
-        if self.typing == "clipboard":
-            # AnyDesk синхронизирует буфер обмена, а вставка не зависит от раскладки
-            # клавиатуры на удалённом ПК и работает с кириллицей.
-            import pyperclip
+    def paste(self, text: str) -> None:
+        """Ввод через буфер обмена: AnyDesk передаёт его на ту сторону, поэтому
+        не важны раскладка клавиатуры пользователя и кириллица."""
+        if self.dry_run:
+            return
+        import pyperclip
 
-            pyperclip.copy(text)
-            time.sleep(0.4)  # даём AnyDesk передать буфер на ту сторону
-            self.gui.hotkey("ctrl", "v")
+        pyperclip.copy(text)
+        time.sleep(0.5)  # даём AnyDesk передать буфер
+        self.gui.hotkey("ctrl", "v")
+
+    def paste_line(self, text: str) -> None:
+        if self.dry_run:
+            return
+        self.paste(text)
+        time.sleep(0.3)
+        self.gui.press("enter")
+
+    def hotkey(self, *keys: str) -> None:
+        if self.dry_run:
+            return
+        if len(keys) == 1:
+            self.gui.press(keys[0])
         else:
-            self.gui.write(text, interval=0.02)
+            self.gui.hotkey(*keys, interval=0.05)
 
-    def open_terminal(self, shell: str, admin: bool) -> None:
-        g = self.gui
-        g.hotkey("win", "r")
+    def open_terminal(self, admin: bool) -> None:
+        """Win+R -> powershell. Для администратора Ctrl+Shift+Enter -> окно UAC."""
+        if self.dry_run:
+            return
+        self.hotkey("win", "r")
         time.sleep(1.2)
-        self.type_text(shell)
+        self.paste("powershell")
         time.sleep(0.3)
         if admin:
-            g.hotkey("ctrl", "shift", "enter")  # запуск от администратора -> окно UAC
+            self.hotkey("ctrl", "shift", "enter")
         else:
-            g.press("enter")
+            self.hotkey("enter")
         time.sleep(2.5)

@@ -3,3 +3,7 @@ __pycache__/
 .venv/
 logs/
 config.toml
+build/
+dist/
+*.spec
+.pytest_cache/

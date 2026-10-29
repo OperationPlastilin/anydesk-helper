@@ -11,6 +11,8 @@ import time
 
 from .screen import Region, primary_monitor, virtual_screen
 
+DOWNLOAD_URL = "https://download.anydesk.com/AnyDesk.exe"
+
 CANDIDATE_PATHS = [
     r"C:\Program Files (x86)\AnyDesk\AnyDesk.exe",
     r"C:\Program Files\AnyDesk\AnyDesk.exe",
@@ -28,18 +30,34 @@ def normalize_address(address: str) -> str:
     return re.sub(r"[\s-]", "", address) if re.fullmatch(r"[\d\s-]+", address) else address
 
 
-def find_executable(configured: str = "") -> str:
+def find_executable(configured: str = "", extra_dirs=()) -> str:
     if configured:
         if not os.path.exists(configured):
             raise FileNotFoundError(f"AnyDesk не найден: {configured}")
         return configured
-    for path in CANDIDATE_PATHS:
+    for path in [*CANDIDATE_PATHS, *(os.path.join(d, "AnyDesk.exe") for d in extra_dirs)]:
         if os.path.exists(path):
             return path
     found = shutil.which("anydesk") or shutil.which("AnyDesk")
     if found:
         return found
-    raise FileNotFoundError("AnyDesk не найден. Укажите путь в config.toml: [anydesk] path = \"...\"")
+    raise FileNotFoundError("AnyDesk не найден. Укажите путь в настройках или скачайте его.")
+
+
+def download(dest_dir) -> str:
+    """Скачивает портативный AnyDesk с официального сайта (если он не установлен)."""
+    import requests
+
+    os.makedirs(dest_dir, exist_ok=True)
+    path = os.path.join(dest_dir, "AnyDesk.exe")
+    tmp = path + ".part"
+    with requests.get(DOWNLOAD_URL, stream=True, timeout=60) as resp:
+        resp.raise_for_status()
+        with open(tmp, "wb") as f:
+            for chunk in resp.iter_content(1 << 16):
+                f.write(chunk)
+    os.replace(tmp, path)
+    return path
 
 
 def connect(exe: str, address: str, password: str | None = None) -> None:
@@ -129,14 +147,16 @@ def wait_for_session(address: str, timeout: int, title_hint: str = ""):
 
 
 def pick_active_window(delay: int = 5):
+    """Техник за delay секунд кликает по окну сеанса — берём активное окно."""
     if sys.platform != "win32":
         return None
     import pygetwindow
 
-    for left in range(delay, 0, -1):
-        print(f"  ...{left}", flush=True)
-        time.sleep(1)
-    return pygetwindow.getActiveWindow()
+    time.sleep(delay)
+    window = pygetwindow.getActiveWindow()
+    if window and any(word in window.title.lower() for word in ("chrome", "firefox", "edge", "opera", "yandex")):
+        return None  # кликнули по браузеру с веб-интерфейсом, а не по AnyDesk
+    return window
 
 
 def set_console_title(title: str) -> None:

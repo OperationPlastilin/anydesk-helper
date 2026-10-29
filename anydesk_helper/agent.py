@@ -1,114 +1,120 @@
-"""Главный цикл: план -> (скриншот -> действие от модели -> выполнение) до завершения."""
+"""Агент: проба системы -> план и вопросы -> шаги (команда / скриншот / клик) до результата.
+
+С оператором (техником) агент общается через объект operator:
+  operator.event(kind, text, **data)  — запись в ход решения тикета;
+  operator.ask(kind, text, **data)    — вопрос, блокирует до ответа;
+  operator.checkpoint()               — пауза/стоп/новые подсказки между шагами;
+  operator.image(step, image)         — сохранить скриншот, вернуть имя файла.
+"""
 
 from __future__ import annotations
 
-import json
 import time
 from dataclasses import dataclass, field
-from datetime import datetime
-from pathlib import Path
 
 from . import screen
-from .actions import Action, ActionError, extract_json, needs_confirmation, parse_action
-from .config import Config
-from .controller import Controller
-from .llm import LLM, LLMError, user_message
-from .prompts import (COORDS_HELP, PLAN_SYSTEM, STEP_SYSTEM, SURFACE, load_playbooks,
-                      playbook_block)
+from .actions import (GUI_ACTIONS, Action, ActionError, extract_json, needs_confirmation,
+                      parse_action)
+from .bridge import INIT, PROBE, CommandResult, enduser_dialog
+from .llm import LLMError, user_message
+from .prompts import (PLAN_USER, STEP_USER, load_playbooks, notes_block, plan_system,
+                      step_system)
+
+YES = "yes"
+NO = "no"
+STOP = "stop"
 
 
 class StopSession(Exception):
     pass
 
 
-class Console:
-    """Общение с оператором. Вынесено отдельно, чтобы в тестах подменять ввод."""
-
-    def say(self, text: str = "") -> None:
-        print(text, flush=True)
-
-    def ask(self, prompt: str) -> str:
-        return input(prompt).strip()
-
-
-class SessionLog:
-    def __init__(self, base_dir: str):
-        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        self.dir = Path(base_dir) / stamp
-        self.dir.mkdir(parents=True, exist_ok=True)
-        self._file = open(self.dir / "session.jsonl", "a", encoding="utf-8")
-
-    def event(self, kind: str, **data) -> None:
-        record = {"time": datetime.now().isoformat(timespec="seconds"), "event": kind, **data}
-        self._file.write(json.dumps(record, ensure_ascii=False) + "\n")
-        self._file.flush()
-
-    def image(self, step: int, frame: screen.Frame, action: Action | None) -> None:
-        points = []
-        if action and action.x is not None:
-            points.append((action.x, action.y))
-        if action and action.x2 is not None:
-            points.append((action.x2, action.y2))
-        screen.annotate(frame.image, points).save(self.dir / f"step_{step:03d}.jpg", quality=80)
-
-
 @dataclass
 class State:
-    task: str
+    probe: str = "unknown"
     plan: list[str] = field(default_factory=list)
-    notes: list[str] = field(default_factory=list)  # ответы и подсказки оператора
+    notes: list[str] = field(default_factory=list)
     history: list[str] = field(default_factory=list)
+    last: str = "(nothing yet - start with step 1 of the plan)"
+    want_screenshot: bool = False
     last_typed: str = ""
     recent: list[tuple] = field(default_factory=list)
 
 
 class Agent:
-    def __init__(self, cfg: Config, llm: LLM, target, controller: Controller,
-                 console: Console | None = None, log: SessionLog | None = None,
-                 surface: str = "anydesk", grab=screen.grab):
-        self.cfg = cfg
+    def __init__(self, settings, llm, target, controller, bridge, operator, ticket: dict,
+                 playbook_dirs=(), grab=screen.grab, sleep=time.sleep):
+        self.s = settings
         self.llm = llm
         self.target = target
         self.controller = controller
-        self.console = console or Console()
-        self.log = log
+        self.bridge = bridge
+        self.op = operator
+        self.ticket = ticket
         self.grab = grab
-        a = cfg.agent
-        self.playbook = ""
-        self.fmt = {"surface": SURFACE[surface], "coords_help": COORDS_HELP[cfg.llm.coords],
-                    "language": a.language}
+        self.sleep = sleep
+        task = f"{ticket.get('title', '')}\n{ticket.get('description', '')}"
+        self.playbook = load_playbooks(playbook_dirs, task)
+        self.state = State()
 
-    # ---------- скриншоты и запросы к модели ----------
+    # ------------------------------------------------------------ общение с моделью
 
     def capture(self) -> screen.Frame:
         self.target.focus()
         region = self.target.region()
-        return screen.make_frame(self.grab(region), region, self.cfg.agent.screenshot_max_side)
+        return screen.make_frame(self.grab(region), region, self.s.screenshot_max_side)
 
-    def ask_model(self, system: str, text: str, frame: screen.Frame, parse):
-        """Запрос к модели с повтором, если ответ не разобрался (до 2 исправлений)."""
+    def ask_model(self, system: str, text: str, parse, frame: screen.Frame | None = None):
+        """Запрос к модели; если ответ не в формате — объясняем ошибку и переспрашиваем."""
         messages = [{"role": "system", "content": system},
-                    user_message(text, frame.to_data_url())]
+                    user_message(text, frame.to_data_url() if frame else None)]
         for attempt in range(3):
             reply = self.llm.chat(messages)
             try:
                 return parse(extract_json(reply))
             except ActionError as e:
-                if self.log:
-                    self.log.event("bad_reply", reply=reply, error=str(e))
+                self.op.event("warning", f"Модель ответила не по формату: {e}", reply=reply[:2000])
                 if attempt == 2:
                     raise
-                self.console.say(f"   (модель ответила некорректно: {e} — переспрашиваю)")
                 messages += [{"role": "assistant", "content": reply},
-                             {"role": "user", "content": f"Your reply was invalid: {e}. "
-                              "Reply with exactly one valid JSON object as described."}]
+                             {"role": "user", "content": f"Invalid reply: {e}. Answer again with ONE "
+                              "JSON object exactly in the required format."}]
 
-    # ---------- этап 1: план и вопросы ----------
+    def call_model(self, fn, *args):
+        """Ошибки API не роняют сеанс: спрашиваем техника, повторять ли."""
+        while True:
+            try:
+                return fn(*args)
+            except LLMError as e:
+                answer = self.op.ask("error", f"Ошибка обращения к модели: {e}\nПовторить запрос?")
+                if answer in (STOP, NO):
+                    raise StopSession from None
 
-    def make_plan(self, state: State) -> None:
-        self.console.say("\n[ИИ] Смотрю на экран и составляю план...")
-        frame = self.capture()
-        system = PLAN_SYSTEM.format(**self.fmt, playbook=playbook_block(self.playbook))
+    # ------------------------------------------------------------ этапы
+
+    def run(self) -> bool:
+        self.op.event("info", "Открываю PowerShell на компьютере пользователя и собираю сведения о системе")
+        self.prepare_console()
+        self.make_plan()
+        return self.loop()
+
+    def prepare_console(self) -> None:
+        self.controller.open_terminal(admin=False)
+        result = self.bridge.run(f"{INIT}; {PROBE}", timeout=40)
+        self.op.event("command", "Сведения о системе", command="(проба системы)",
+                      output=result.output, status=result.status, exit_code=result.exit_code)
+        if result.status == "done":
+            self.state.probe = result.output.strip()
+            self.state.last = "Console is open (not admin unless the probe says admin: True)."
+        else:
+            self.op.event("warning", "Консоль не ответила. Проверьте в AnyDesk: «Передавать "
+                          "комбинации клавиш» и синхронизацию буфера обмена.")
+            self.state.last = result.for_model()
+            self.state.want_screenshot = self.s.vision
+
+    def make_plan(self) -> None:
+        st, t = self.state, self.ticket
+        system = plan_system(self.s.language, self.playbook)
 
         def parse(data: dict) -> dict:
             plan = data.get("plan")
@@ -117,183 +123,191 @@ class Agent:
             questions = data.get("questions") or []
             if not isinstance(questions, list):
                 raise ActionError("'questions' must be a list")
-            return {"understanding": str(data.get("understanding", "")),
-                    "plan": [str(s) for s in plan], "questions": [str(q) for q in questions]}
+            return {"summary": str(data.get("summary", "")),
+                    "plan": [str(p) for p in plan], "questions": [str(q) for q in questions]}
 
-        result = self.ask_model(system, f"Operator's task: {state.task}\n"
-                                f"Screenshot size: {frame.size[0]}x{frame.size[1]}.", frame, parse)
-        state.plan = result["plan"]
-        if self.log:
-            self.log.event("plan", **result)
-        if result["understanding"]:
-            self.console.say(f"[ИИ] Понял задачу так: {result['understanding']}")
-        for q in result["questions"]:
-            answer = self.console.ask(f"[ИИ спрашивает] {q}\n  > ")
-            state.notes.append(f"Q: {q} A: {answer or '(no answer)'}")
-        self.show_plan(state)
-        fix = self.console.ask("Enter — начать, или напишите поправку к плану: ")
-        if fix:
-            state.notes.append(f"Operator's correction to the plan: {fix}")
-
-    def show_plan(self, state: State) -> None:
-        self.console.say("[ИИ] План:")
-        for i, step in enumerate(state.plan, 1):
-            self.console.say(f"   {i}. {step}")
-
-    # ---------- этап 2: пошаговое выполнение ----------
-
-    def step_prompt(self, state: State, step: int, frame: screen.Frame) -> str:
-        lines = [f"TASK: {state.task}", "PLAN:"]
-        lines += [f"{i}. {s}" for i, s in enumerate(state.plan, 1)]
-        if state.notes:
-            lines.append("OPERATOR NOTES (answers and hints, follow them):")
-            lines += [f"- {n}" for n in state.notes]
-        keep = self.cfg.agent.history
-        if state.history:
-            lines.append("YOUR PREVIOUS ACTIONS (oldest first):")
-            lines += state.history[-keep:]
-        w, h = frame.size
-        lines.append(f"STEP {step}/{self.cfg.agent.max_steps}. Screenshot {w}x{h} px. "
-                     "Reply with one JSON action.")
-        return "\n".join(lines)
-
-    def next_action(self, state: State, step: int, frame: screen.Frame) -> Action:
-        system = STEP_SYSTEM.format(**self.fmt, playbook=playbook_block(self.playbook))
-        w, h = frame.size
-        return self.ask_model(system, self.step_prompt(state, step, frame), frame,
-                              lambda d: parse_action(d, w, h, self.cfg.llm.coords))
-
-    def confirm(self, action: Action) -> tuple[bool, str]:
-        """Возвращает (выполнять ли, подсказка оператора)."""
-        answer = self.console.ask(
-            "   Выполнить? [Enter/y — да, n — пропустить, q — стоп, или напишите подсказку]: ")
-        low = answer.lower()
-        if low in ("", "y", "д", "да", "yes"):
-            return True, ""
-        if low in ("q", "stop", "стоп"):
-            raise StopSession
-        if low in ("n", "н", "нет", "no"):
-            return False, ""
-        return False, answer
-
-    def pause_menu(self, state: State) -> None:
-        self.console.say("\n[Пауза]")
         while True:
-            choice = self.console.ask("c — продолжить, h — подсказать агенту, p — показать план, "
-                                      "q — завершить: ").lower()
-            if choice in ("c", "с", ""):
+            user = PLAN_USER.format(ticket_id=t.get("id", ""), title=t.get("title", ""),
+                                    description=t.get("description", ""), probe=st.probe,
+                                    notes=notes_block(st.notes))
+            self.op.event("prompt", "Промт для составления плана", system=system, user=user)
+            self.op.event("info", "ИИ составляет план…")
+            result = self.call_model(self.ask_model, system, user, parse)
+            st.plan = result["plan"]
+            self.op.event("plan", result["summary"], plan=st.plan, questions=result["questions"])
+            for q in result["questions"]:
+                answer = self.op.ask("question", q)
+                self.check_stop(answer)
+                st.notes.append(f"Q: {q} A: {answer or '(no answer)'}")
+            answer = self.op.ask("plan", "Проверьте план. Начать выполнение?", plan=st.plan)
+            self.check_stop(answer)
+            if answer in ("", YES):
                 return
-            if choice in ("q", "й"):
-                raise StopSession
-            if choice == "p":
-                self.show_plan(state)
-            if choice in ("h", "р"):
-                hint = self.console.ask("Подсказка: ")
-                if hint:
-                    state.notes.append(hint)
-                return
+            # Техник поправил план — учитываем и составляем заново.
+            st.notes.append(f"Technician's correction to the plan: {answer}")
 
-    def remember(self, state: State, step: int, text: str) -> None:
-        state.history.append(f"{step}. {text}")
-        if self.log:
-            self.log.event("history", text=text)
+    def step_text(self, step: int, frame: screen.Frame | None) -> str:
+        st, t = self.state, self.ticket
+        image_note = ""
+        if frame:
+            w, h = frame.size
+            image_note = f" A screenshot of the customer's screen is attached ({w}x{h} px)."
+        return STEP_USER.format(
+            ticket_id=t.get("id", ""), title=t.get("title", ""), description=t.get("description", ""),
+            probe=st.probe, plan="\n".join(f"{i}. {p}" for i, p in enumerate(st.plan, 1)),
+            notes=notes_block(st.notes), history="\n".join(st.history[-20:]) or "(empty)",
+            last=st.last, step=step, max_steps=self.s.max_steps, image_note=image_note)
 
-    def run(self, task: str) -> bool:
-        state = State(task=task)
-        self.playbook = load_playbooks(self.cfg.agent.playbooks_dir, task)
-        if self.log:
-            self.log.event("start", task=task, model=self.cfg.llm.model)
-        try:
-            self.make_plan(state)
-            return self.loop(state)
-        except (StopSession, KeyboardInterrupt):
-            self.console.say("\n[Сеанс остановлен оператором]")
-            return False
-        finally:
-            if self.log:
-                self.console.say(f"Лог и скриншоты: {self.log.dir}")
-
-    def loop(self, state: State) -> bool:
-        a_cfg = self.cfg.agent
-        step = 0
-        while step < a_cfg.max_steps:
-            try:
-                step += 1
+    def loop(self) -> bool:
+        system = step_system(self.s.language, self.s.vision, self.s.coords, self.playbook)
+        first = True
+        for step in range(1, self.s.max_steps + 1):
+            self.state.notes += self.op.checkpoint()
+            frame = None
+            if self.state.want_screenshot and self.s.vision:
                 frame = self.capture()
-                self.console.say(f"\n[Шаг {step}] думаю...")
-                try:
-                    action = self.next_action(state, step, frame)
-                except ActionError as e:
-                    self.remember(state, step, f"(your reply was invalid: {e})")
-                    continue
-                if self.log:
-                    self.log.image(step, frame, action)
-                    self.log.event("action", step=step, action=action.__dict__)
-                if action.thought:
-                    self.console.say(f"   {action.thought}")
-                self.console.say(f"   -> {action.describe()}" + ("  [!]" if action.risky else ""))
-
-                if action.type == "ask_user":
-                    answer = self.console.ask(f"[ИИ спрашивает] {action.text}\n  > ")
-                    state.notes.append(f"Q: {action.text} A: {answer or '(no answer)'}")
-                    self.remember(state, step, f"asked operator: {action.text!r} -> {answer!r}")
-                    continue
-                if action.type == "done":
-                    self.console.say(f"[ИИ] Готово: {action.text}")
-                    if a_cfg.confirm == "none":
-                        return True
-                    verdict = self.console.ask("Задача решена? [Enter/y — да, "
-                                               "или напишите, что не так]: ")
-                    if verdict.lower() in ("", "y", "д", "да", "yes"):
-                        return True
-                    state.notes.append(f"Operator says the task is NOT done yet: {verdict}")
-                    self.remember(state, step, "done -> operator rejected: " + verdict)
-                    continue
-                if action.type == "fail":
-                    self.console.say(f"[ИИ] Не получается: {action.text}")
-                    hint = self.console.ask("Напишите подсказку, чтобы продолжить, "
-                                            "или Enter — завершить: ")
-                    if not hint:
-                        return False
-                    state.notes.append(hint)
-                    self.remember(state, step, f"fail -> operator hint: {hint}")
-                    continue
-
-                if needs_confirmation(action, a_cfg.confirm, state.last_typed):
-                    ok, hint = self.confirm(action)
-                    if not ok:
-                        if hint:
-                            state.notes.append(hint)
-                        self.remember(state, step, f"{action.describe()} -> REJECTED by operator"
-                                      + (f", hint: {hint}" if hint else ""))
-                        continue
-
-                try:
-                    result = self.controller.execute(action, frame)
-                except Exception as e:
-                    if type(e).__name__ == "FailSafeException":  # pyautogui: мышь в углу
-                        raise StopSession from None
-                    result = f"ERROR: {e}"
-                if action.type == "type":
-                    state.last_typed = "" if action.enter else action.text
-                elif action.type == "key" and action.keys == ["enter"]:
-                    state.last_typed = ""
-                self.remember(state, step, f"{action.describe()} -> {result}")
-                self.check_loop(state, step, action)
-                time.sleep(a_cfg.step_delay)
-            except KeyboardInterrupt:
-                self.pause_menu(state)
-            except LLMError as e:
-                self.console.say(f"[Ошибка модели] {e}")
-                if self.console.ask("Повторить? [Enter — да, q — стоп]: ").lower() == "q":
-                    return False
-        self.console.say(f"[ИИ] Достигнут лимит шагов ({a_cfg.max_steps}).")
+                self.state.want_screenshot = False
+            text = self.step_text(step, frame)
+            if first:
+                self.op.event("prompt", "Промт для шагов (первый шаг)", system=system, user=text)
+                first = False
+            w, h = frame.size if frame else (0, 0)
+            try:
+                action = self.call_model(self.ask_model, system, text,
+                                         lambda d: parse_action(d, w, h, self.s.coords), frame)
+            except ActionError as e:
+                self.state.last = f"Your previous reply was invalid: {e}"
+                continue
+            if action.type in GUI_ACTIONS and not self.s.vision:
+                self.state.last = "Screen actions are not available. Use console commands or ask_operator."
+                continue
+            image = self.op.image(step, screen.annotate(frame.image, _points(action))) if frame else None
+            self.op.event("step", action.thought, step=step, observation=action.observation,
+                          plan_step=action.plan_step, action=action.type,
+                          description=action.describe(), risky=action.risky, image=image)
+            finished = self.handle(action, step, frame)
+            if finished is not None:
+                return finished
+        self.op.event("warning", f"Достигнут лимит шагов ({self.s.max_steps})")
         return False
 
-    def check_loop(self, state: State, step: int, action: Action) -> None:
-        """Слабые модели часто повторяют одно и то же действие — подсказываем им."""
-        state.recent = (state.recent + [action.signature()])[-3:]
-        if len(state.recent) == 3 and len(set(state.recent)) == 1:
-            self.remember(state, step, "NOTE: you repeated the same action 3 times and it does "
-                          "not help. Choose a different approach or ask_user.")
-            state.recent.clear()
+    # ------------------------------------------------------------ действия
+
+    def handle(self, a: Action, step: int, frame) -> bool | None:
+        """Выполняет действие. True/False — сеанс закончен (успех/нет), None — продолжаем."""
+        st = self.state
+        if a.type == "ask_operator":
+            answer = self.op.ask("question", a.text)
+            self.check_stop(answer)
+            st.notes.append(f"Q: {a.text} A: {answer or '(no answer)'}")
+            return self.remember(step, a, f"technician answered: {answer!r}")
+        if a.type == "done":
+            if self.s.confirm == "none":
+                self.op.event("done", a.text)
+                return True
+            answer = self.op.ask("done", f"ИИ считает задачу решённой: {a.text}\nПодтверждаете?")
+            self.check_stop(answer)
+            if answer in ("", YES):
+                self.op.event("done", a.text)
+                return True
+            st.notes.append(f"Technician says the task is NOT done yet: {answer}")
+            return self.remember(step, a, f"technician rejected: {answer}")
+        if a.type == "fail":
+            answer = self.op.ask("fail", f"ИИ не может решить задачу: {a.text}\n"
+                                 "Дайте подсказку, чтобы продолжить, или завершите сеанс.")
+            if answer in ("", STOP, NO):
+                self.op.event("failed", a.text)
+                return False
+            st.notes.append(answer)
+            return self.remember(step, a, f"technician hint: {answer}")
+
+        if needs_confirmation(a, self.s.confirm, st.last_typed):
+            answer = self.op.ask("confirm", a.describe(), action=a.type, risky=a.risky,
+                                 command=a.command)
+            self.check_stop(answer)
+            if answer != YES:
+                hint = "" if answer == NO else answer
+                if hint:
+                    st.notes.append(hint)
+                return self.remember(step, a, "REJECTED by technician" + (f", hint: {hint}" if hint else ""))
+
+        if a.type == "run":
+            result = self.bridge.run(a.command, timeout=a.timeout)
+            self.log_command(a.command, result)
+            return self.remember(step, a, result.for_model())
+        if a.type == "wait":
+            if self.bridge.pending:
+                result = self.bridge.wait(a.seconds)
+                self.log_command("(ожидание завершения команды)", result)
+                return self.remember(step, a, result.for_model())
+            self.sleep(a.seconds)
+            st.want_screenshot = self.s.vision
+            return self.remember(step, a, "waited")
+        if a.type == "open_terminal":
+            self.bridge.pending = None
+            self.controller.open_terminal(admin=a.admin)
+            if a.admin:
+                st.want_screenshot = self.s.vision
+                return self.remember(step, a, "Admin PowerShell requested: a UAC prompt should be on "
+                                     "the screen now. Confirm it (Yes/Да), then check with a command.")
+            result = self.bridge.run(f"{INIT}; 'console ready'", timeout=30)
+            return self.remember(step, a, result.for_model())
+        if a.type == "ask_enduser":
+            self.op.event("info", f"Вопрос пользователю на его экране: {a.text}")
+            result = self.bridge.run(enduser_dialog(a.text), timeout=300)
+            self.log_command("(диалог с пользователем)", result)
+            if result.status == "done":
+                answer = result.output.split("ANSWER:", 1)[-1].strip()
+                st.notes.append(f"Customer was asked: {a.text} Customer answered: {answer or '(empty)'}")
+                return self.remember(step, a, f"customer answered: {answer!r}")
+            return self.remember(step, a, result.for_model())
+        if a.type == "screenshot":
+            st.want_screenshot = True
+            return self.remember(step, a, "screenshot will be attached to the next message")
+
+        # GUI-действия
+        try:
+            result = self.controller.execute(a, frame)
+        except Exception as e:
+            if type(e).__name__ == "FailSafeException":  # pyautogui: мышь увели в угол
+                raise StopSession from None
+            result = f"ERROR: {e}"
+        if a.type == "type":
+            st.last_typed = "" if a.enter else a.text
+        elif a.type == "key" and a.keys == ["enter"]:
+            st.last_typed = ""
+        st.want_screenshot = True  # после клика надо посмотреть, что получилось
+        self.sleep(self.s.step_delay)
+        return self.remember(step, a, result + "; new screenshot attached")
+
+    def log_command(self, command: str, result: CommandResult) -> None:
+        self.op.event("command", command, command=command, output=result.output,
+                      status=result.status, exit_code=result.exit_code)
+        if result.status == "no_ack" and self.s.vision:
+            self.state.want_screenshot = True
+
+    def remember(self, step: int, a: Action, result: str) -> None:
+        st = self.state
+        st.last = f"{a.describe()}\n-> {result}"
+        short = result.replace("\n", " ")
+        st.history.append(f"{step}. {a.describe()[:200]} -> {short[:200]}")
+        st.recent = (st.recent + [a.signature()])[-3:]
+        if len(st.recent) == 3 and len(set(st.recent)) == 1:
+            st.last += ("\nNOTE: you repeated the same action 3 times without progress. "
+                        "Choose a different approach or ask_operator.")
+            st.recent.clear()
+        return None
+
+    @staticmethod
+    def check_stop(answer: str) -> None:
+        if answer == STOP:
+            raise StopSession
+
+
+def _points(a: Action) -> list[tuple[float, float]]:
+    points = []
+    if a.x is not None:
+        points.append((a.x, a.y))
+    if a.x2 is not None:
+        points.append((a.x2, a.y2))
+    return points

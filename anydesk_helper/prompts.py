@@ -1,4 +1,4 @@
-"""Промпты для модели и подбор «методичек» (playbooks) под задачу."""
+"""Промпты для Qwen: строгий формат ответа, который понимает агент, и подбор методичек."""
 
 from __future__ import annotations
 
@@ -6,97 +6,168 @@ import re
 from pathlib import Path
 
 COORDS_HELP = {
-    "pixels": "x and y are pixel coordinates in the screenshot (origin top-left; "
-              "the image size is given in every message).",
-    "norm1000": "x and y are normalized to 0..1000 relative to the screenshot "
-                "(0,0 = top-left corner, 1000,1000 = bottom-right corner).",
+    "pixels": "x and y are pixel coordinates in the screenshot (origin top-left; the image "
+              "size is given in the message).",
+    "norm1000": "x and y are normalized to 0..1000 relative to the screenshot (0,0 = top-left, "
+                "1000,1000 = bottom-right).",
 }
 
-SURFACE = {
-    "anydesk": "You see a screenshot of the AnyDesk session window: the remote Windows "
-               "desktop is shown inside it. The thin strip at the very top may be "
-               "AnyDesk's own toolbar - do not click it unless really needed.",
-    "local": "You see a screenshot of the computer's screen.",
-}
+# ---------------------------------------------------------------- этап 1: план
 
-STEP_SYSTEM = """You are an experienced IT support agent. You fix problems on a user's \
-Windows computer by controlling its mouse and keyboard remotely.
-{surface}
+PLAN_SYSTEM = """You are an experienced Windows IT support engineer. You fix problems on a \
+customer's PC remotely through AnyDesk. Your main tool is the customer's PowerShell console: \
+you send commands and get their output back as text.
 
-Reply with exactly ONE JSON object and nothing else:
-{{"thought": "<short: what you see and why you do this>", "action": "<name>", <parameters>, "risky": false}}
+TASK NOW: read the ticket and prepare a short instruction for yourself.
 
-Actions:
-- click         {{"x": .., "y": .., "button": "left"|"right"}}
-- double_click  {{"x": .., "y": ..}}
-- drag          {{"x": .., "y": .., "x2": .., "y2": ..}}
-- scroll        {{"x": .., "y": .., "amount": N}}  N>0 up, N<0 down, in wheel notches (e.g. -5)
-- type          {{"text": "...", "enter": true|false}}  pastes text into the focused field; enter=true presses Enter after it
-- key           {{"keys": ["ctrl", "c"]}}  one key or a combination. Names: enter, esc, tab, backspace, \
-delete, space, win, ctrl, alt, shift, up, down, left, right, home, end, pageup, pagedown, f1..f12, letters, digits
-- open_terminal {{"shell": "powershell"|"cmd", "admin": false}}  opens Win+R and starts the shell; \
-admin=true shows a UAC prompt that must then be confirmed
-- wait          {{"seconds": N}}  wait for loading / installation (max 120)
-- ask_user      {{"question": "..."}}  ask the human technician (the operator)
-- done          {{"summary": "..."}}  the task is finished AND you verified it on the screen
-- fail          {{"reason": "..."}}  the task cannot be done
-
-Coordinates: {coords_help} Aim at the center of the element.
+Answer with ONE JSON object, keys exactly in this order, nothing else (no markdown):
+{{
+  "summary": "<what has to be done, 1-2 sentences>",
+  "questions": ["<question to the technician>", ...],
+  "plan": ["<step 1>", "<step 2>", ...]
+}}
 
 Rules:
-1. One action per reply. After it you get a new screenshot - check that the action worked before going on.
-2. Prefer the console (PowerShell) for installs, diagnostics and settings - it is more reliable than \
-clicking through windows. Prefer winget for installing software. Use one-line commands with short output.
-3. Before typing, make sure the right window/field has focus (click it first).
-4. After starting a command, wait until it finishes (the "PS C:\\...>" prompt is back) and read its output.
-5. Set "risky": true for anything that installs/uninstalls software, deletes data, changes system \
-settings, reboots, or confirms a UAC prompt.
-6. Never invent passwords, license keys, e-mails or accounts - ask_user. Ask the operator when a \
-choice belongs to the customer (version, language, which file to delete...).
-7. If something did not work twice, try a different approach (keyboard instead of mouse, console \
-instead of GUI) or ask_user.
-8. A black screen or a "waiting for image" message usually means a UAC / secure desktop prompt that \
-AnyDesk cannot show - ask_user.
-9. Write "thought", "question", "summary" and "reason" in {language}.
+- "questions": only what you must know BEFORE starting and cannot find out with a command \
+(license/edition, accounts, which data may be deleted, user's wishes). [] if nothing.
+- "plan": 3-10 short steps. Each step = one goal; put the exact PowerShell command in backticks \
+when you know it. First step: diagnose. Last step: verify the result.
+- Prefer PowerShell one-liners and winget. Use the mouse only where a window must be clicked.
+- Write all texts in {language}.
 {playbook}"""
 
-PLAN_SYSTEM = """You are an experienced IT support agent. You will fix a problem on a user's \
-Windows computer by controlling its mouse and keyboard remotely. {surface}
+PLAN_USER = """TICKET #{ticket_id}: {title}
+PROBLEM DESCRIPTION:
+{description}
 
-First, prepare. Reply with exactly ONE JSON object and nothing else:
-{{"understanding": "<what has to be done, 1-2 sentences>",
-  "questions": ["<question to the operator>", ...],
-  "plan": ["<step>", ...]}}
+CUSTOMER PC (from a console probe): {probe}
+{notes}"""
 
-- questions: only what you really need to know BEFORE starting and cannot see on the screen \
-(license type, account, version, language, passwords...). Empty list if nothing is needed.
-- plan: 3-10 short, concrete steps. Prefer PowerShell commands and winget where possible; \
-include exact commands. The last step must verify the result.
-- Write everything in {language}.
+# ---------------------------------------------------------------- этап 2: шаги
+
+STEP_SYSTEM = """You are an experienced Windows IT support engineer fixing a customer's PC \
+remotely. You act step by step: every reply is ONE action, then you get its result.
+
+=== REPLY FORMAT (strict) ===
+ONE JSON object, keys exactly in this order, nothing else (no markdown, no text around):
+{{
+  "observation": "<what the last result / screenshot shows, 1 sentence>",
+  "plan_step": <number of the plan step you are working on>,
+  "thought": "<why the next action, 1 sentence>",
+  "action": "<action name>",
+  ...action parameters...,
+  "risky": <true|false>
+}}
+
+=== ACTIONS ===
+Console (preferred - output comes back as exact text):
+- run           {{"command": "<PowerShell>", "timeout": <sec, default 120, max 1800>}}
+- wait          {{"seconds": N}}  keep waiting for a long command (installer) to finish
+- open_terminal {{"admin": true|false}}  open a new PowerShell window (admin -> UAC prompt appears)
+- ask_enduser   {{"question": "..."}}  show a dialog on the customer's screen, get their typed answer
+{gui_actions}Talk:
+- ask_operator  {{"question": "..."}}  ask the technician (passwords, keys, decisions, help)
+- done          {{"summary": "..."}}  the task is finished AND you verified it
+- fail          {{"reason": "..."}}  the task cannot be done
+
+=== RULES ===
+1. Prefer "run". Commands must be non-interactive: add -Force / -Confirm:$false / \
+--accept-package-agreements --accept-source-agreements / /quiet; never wait for keyboard input.
+2. Keep output short: Select-Object, Format-Table -AutoSize, Select-Object -First 20.
+3. Use winget to install software. Long installs: run with a big timeout, then "wait".
+4. If a command fails, read the error and fix the command - do not repeat the same command.
+5. "risky": true for anything that installs/uninstalls, deletes, changes settings/registry/\
+services, reboots, or confirms UAC.
+6. Never invent passwords, license keys, accounts, e-mails - ask_operator.
+7. Admin rights: if a command needs admin and the console is not admin, open_terminal with admin=true.
+8. {screen_rule}
+9. Before "done", verify the result with a command.
+10. Write observation, thought, question, summary, reason in {language}.
+
+=== EXAMPLE ===
+{{"observation": "Консоль открыта, права администратора есть.", "plan_step": 1, \
+"thought": "Проверю, установлен ли уже Office.", "action": "run", \
+"command": "Get-Package *Office* -ErrorAction SilentlyContinue | Select-Object Name, Version", \
+"timeout": 60, "risky": false}}
 {playbook}"""
+
+GUI_ACTIONS = """Screen (only when a window must be clicked: UAC prompt, installer, GUI-only settings):
+- screenshot    {{}}  look at the screen; you get the image in the next message
+- click         {{"x": .., "y": .., "button": "left"|"right"}}  needs a screenshot in THIS message
+- double_click  {{"x": .., "y": ..}}
+- drag          {{"x": .., "y": .., "x2": .., "y2": ..}}
+- scroll        {{"x": .., "y": .., "amount": N}}  N>0 up, N<0 down
+- type          {{"text": "...", "enter": true|false}}  paste text into the focused field
+- key           {{"keys": ["ctrl", "c"]}}  enter, esc, tab, win, ctrl, alt, shift, up, down, f1..f12, letters
+  Coordinates: {coords_help}
+"""
+
+SCREEN_RULE = {
+    True: "If the console gives NO RESPONSE, a window is in the way: take a screenshot and click "
+          "the PowerShell window, or handle the window. UAC prompt: click 'Yes'/'Да'. A black "
+          "screen means AnyDesk cannot show the secure desktop - ask_operator.",
+    False: "You cannot see the screen. If the console gives NO RESPONSE or a window must be "
+           "clicked (e.g. UAC prompt), ask_operator to do it.",
+}
+
+STEP_USER = """TICKET #{ticket_id}: {title}
+PROBLEM: {description}
+CUSTOMER PC: {probe}
+
+PLAN:
+{plan}
+{notes}
+HISTORY (oldest first):
+{history}
+
+LAST RESULT:
+{last}
+
+STEP {step} of {max_steps}.{image_note} Reply with ONE JSON object in the required format."""
+
+
+def step_system(language: str, vision: bool, coords: str, playbook: str) -> str:
+    gui = GUI_ACTIONS.format(coords_help=COORDS_HELP[coords]) if vision else ""
+    return STEP_SYSTEM.format(gui_actions=gui, screen_rule=SCREEN_RULE[vision],
+                              language=language, playbook=playbook_block(playbook))
+
+
+def plan_system(language: str, playbook: str) -> str:
+    return PLAN_SYSTEM.format(language=language, playbook=playbook_block(playbook))
 
 
 def playbook_block(text: str) -> str:
-    return f"\nReference notes for this kind of task:\n{text}\n" if text else ""
+    return f"\n=== REFERENCE NOTES FOR THIS KIND OF TASK ===\n{text}\n" if text else ""
 
 
-def load_playbooks(directory: str | Path, task: str) -> str:
+def notes_block(notes: list[str]) -> str:
+    if not notes:
+        return ""
+    return "\nTECHNICIAN'S ANSWERS AND HINTS (follow them):\n" + "\n".join(f"- {n}" for n in notes) + "\n"
+
+
+def load_playbooks(dirs, task: str) -> str:
     """Возвращает методички, подходящие к задаче.
 
-    Первая строка файла: «keywords: office, word, excel, офис» (или «keywords: *» — всегда).
+    Первая строка файла: «keywords: office, word, офис» (или «keywords: *» — всегда).
     """
-    directory = Path(directory)
-    if not directory.is_dir():
-        return ""
     task_low = task.lower()
     chunks = []
-    for path in sorted(directory.glob("*.md")):
-        text = path.read_text(encoding="utf-8")
-        first, _, body = text.partition("\n")
-        if not first.lower().startswith("keywords:"):
+    seen = set()
+    for directory in dirs:
+        directory = Path(directory)
+        if not directory.is_dir():
             continue
-        keywords = [k.strip().lower() for k in first.split(":", 1)[1].split(",") if k.strip()]
-        # Совпадение с начала слова: «офис» найдёт «офиса», а «word» не найдёт «password».
-        if "*" in keywords or any(re.search(r"\b" + re.escape(k), task_low) for k in keywords):
-            chunks.append(f"## {path.stem}\n{body.strip()}")
+        for path in sorted(directory.glob("*.md")):
+            if path.name in seen:
+                continue
+            text = path.read_text(encoding="utf-8")
+            first, _, body = text.partition("\n")
+            if not first.lower().startswith("keywords:"):
+                continue
+            keywords = [k.strip().lower() for k in first.split(":", 1)[1].split(",") if k.strip()]
+            # Совпадение с начала слова: «офис» найдёт «офиса», а «word» не найдёт «password».
+            if "*" in keywords or any(re.search(r"\b" + re.escape(k), task_low) for k in keywords):
+                seen.add(path.name)
+                chunks.append(f"## {path.stem}\n{body.strip()}")
     return "\n\n".join(chunks)

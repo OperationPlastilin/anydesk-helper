@@ -1,0 +1,51 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AnyDesk Helper</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%23e5484d'/%3E%3Cpath d='M9 11l6 5-6 5M17 22h7' stroke='white' stroke-width='3' fill='none' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="/static/style.css">
+<script>
+  window.APP = { token: "__TOKEN__", version: "__VERSION__", dev: __DEV__ };
+</script>
+</head>
+<body>
+<header class="topbar">
+  <a class="brand" href="#/">
+    <span class="logo">&gt;_</span>
+    <span>AnyDesk Helper</span>
+  </a>
+  <span class="version" id="version"></span>
+  <span class="update-badge hidden" id="update-badge"></span>
+  <span class="spacer"></span>
+  <span class="active-session hidden" id="active-session"></span>
+  <a class="btn ghost" href="#/settings">Настройки</a>
+</header>
+
+<div class="layout">
+  <aside class="sidebar">
+    <a class="btn primary block" href="#/new">+ Новый тикет</a>
+    <div class="filters">
+      <input type="search" id="search" placeholder="Поиск: текст, #номер, ID AnyDesk">
+      <select id="status-filter">
+        <option value="">Все статусы</option>
+        <option value="new">Новые</option>
+        <option value="running">В работе</option>
+        <option value="waiting">Ждут ответа</option>
+        <option value="solved">Решённые</option>
+        <option value="failed">Не решённые</option>
+        <option value="stopped">Остановленные</option>
+      </select>
+    </div>
+    <nav id="ticket-list" class="ticket-list"></nav>
+  </aside>
+
+  <main id="main" class="main"></main>
+</div>
+
+<div id="lightbox" class="lightbox hidden"><img alt=""></div>
+<div id="toast" class="toast hidden"></div>
+<script src="/static/app.js"></script>
+</body>
+</html>

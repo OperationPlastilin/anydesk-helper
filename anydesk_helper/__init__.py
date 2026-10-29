@@ -1,3 +1,5 @@
 """AI-агент техподдержки, работающий через AnyDesk."""
 
-__version__ = "0.1.0"
+from .version import __version__
+
+__all__ = ["__version__"]

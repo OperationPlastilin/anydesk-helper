@@ -6,10 +6,12 @@ import json
 import re
 from dataclasses import dataclass, field
 
-ACTION_TYPES = (
-    "click", "double_click", "right_click", "drag", "scroll", "type", "key",
-    "open_terminal", "wait", "ask_user", "done", "fail",
-)
+CONSOLE_ACTIONS = ("open_terminal", "run", "wait", "ask_enduser")
+GUI_ACTIONS = ("screenshot", "click", "double_click", "right_click", "drag", "scroll", "type", "key")
+TALK_ACTIONS = ("ask_operator", "done", "fail")
+ACTION_TYPES = CONSOLE_ACTIONS + GUI_ACTIONS + TALK_ACTIONS
+ALIASES = {"ask_user": "ask_operator", "ask": "ask_operator", "command": "run", "powershell": "run",
+           "shell": "run", "exec": "run", "finish": "done", "look": "screenshot"}
 POINTER_ACTIONS = ("click", "double_click", "right_click", "drag", "scroll")
 
 KEY_ALIASES = {
@@ -34,6 +36,9 @@ DANGEROUS_PATTERNS = [
     r"\bcipher\b", r"\bclear-disk\b", r"\bremove-partition\b", r"\bnet\s+user\b",
     r"\buninstall\b", r"\bremove-appxpackage\b", r"\bvssadmin\b", r"\bwmic\b.*\bdelete\b",
     r"\bremove-localuser\b", r"\bdisable-", r"\bstop-service\b", r"\bsc\s+(delete|stop|config)\b",
+    r"\binstall", r"\bmsiexec\b", r"\bsetup\.exe\b", r"\bset-itemproperty\b",
+    r"\bnew-itemproperty\b", r"\bremove-", r"\bset-service\b", r"\bnetsh\b",
+    r"-verb\s+runas\b", r"\btakeown\b", r"\bicacls\b", r"\bset-mppreference\b",
 ]
 DANGEROUS_HOTKEYS = [{"alt", "f4"}, {"ctrl", "alt", "delete"}, {"win", "l"}]
 
@@ -45,16 +50,19 @@ class ActionError(ValueError):
 @dataclass
 class Action:
     type: str
+    observation: str = ""
+    plan_step: int | None = None
     thought: str = ""
     x: float | None = None  # в пикселях отправленного скриншота
     y: float | None = None
     x2: float | None = None
     y2: float | None = None
     text: str = ""  # текст для type, вопрос, итог или причина неудачи
+    command: str = ""
+    timeout: float = 120.0
     keys: list[str] = field(default_factory=list)
     amount: int = 0
     seconds: float = 0.0
-    shell: str = "powershell"
     admin: bool = False
     enter: bool = False
     risky: bool = False
@@ -62,7 +70,7 @@ class Action:
     def signature(self) -> tuple:
         """Для обнаружения зацикливания: одинаковые действия дают одинаковую подпись."""
         point = (round(self.x or 0, -1), round(self.y or 0, -1))
-        return (self.type, point, self.text, tuple(self.keys))
+        return (self.type, point, self.text, self.command, tuple(self.keys))
 
     def describe(self) -> str:
         t = self.type
@@ -77,9 +85,13 @@ class Action:
         if t == "key":
             return "key " + "+".join(self.keys)
         if t == "open_terminal":
-            return f"open_terminal {self.shell}" + (" (admin)" if self.admin else "")
+            return "open_terminal" + (" (admin)" if self.admin else "")
+        if t == "run":
+            return f"run: {self.command}"
         if t == "wait":
             return f"wait {self.seconds:g}s"
+        if t == "screenshot":
+            return "screenshot"
         return f"{t}: {self.text}"
 
 
@@ -145,12 +157,20 @@ def normalize_keys(raw) -> list[str]:
     return keys
 
 
-def parse_action(data: dict, img_w: int, img_h: int, coords: str = "pixels") -> Action:
-    """Проверяет JSON от модели. Координаты возвращаются в пикселях скриншота."""
+def parse_action(data: dict, img_w: int = 0, img_h: int = 0, coords: str = "pixels") -> Action:
+    """Проверяет JSON от модели. Координаты возвращаются в пикселях скриншота.
+
+    img_w/img_h = 0 означает, что в этом шаге скриншота не было — GUI-клики запрещены.
+    """
     kind = str(data.get("action") or data.get("type") or "").strip().lower()
+    kind = ALIASES.get(kind, kind)
     if kind not in ACTION_TYPES:
         raise ActionError(f"Unknown action {kind!r}. Allowed: {', '.join(ACTION_TYPES)}")
-    a = Action(type=kind, thought=str(data.get("thought", "")).strip(),
+    step = data.get("plan_step")
+    a = Action(type=kind,
+               observation=str(data.get("observation", "")).strip(),
+               plan_step=int(step) if isinstance(step, (int, float)) or str(step).isdigit() else None,
+               thought=str(data.get("thought", "")).strip(),
                risky=bool(data.get("risky", False)))
 
     def to_px(x: float, y: float) -> tuple[float, float]:
@@ -161,6 +181,9 @@ def parse_action(data: dict, img_w: int, img_h: int, coords: str = "pixels") -> 
         return x, y
 
     if kind in POINTER_ACTIONS:
+        if not img_w:
+            raise ActionError("You have no screenshot in this step. Use the screenshot action "
+                              "first, then click on what you see.")
         a.x, a.y = to_px(*_point(data, "x", "y"))
     if kind == "drag":
         a.x2, a.y2 = to_px(*_point(data, "x2", "y2"))
@@ -178,16 +201,19 @@ def parse_action(data: dict, img_w: int, img_h: int, coords: str = "pixels") -> 
     if kind == "key":
         a.keys = normalize_keys(data.get("keys", data.get("key")))
     if kind == "open_terminal":
-        a.shell = str(data.get("shell", "powershell")).lower()
-        if a.shell not in ("powershell", "cmd"):
-            raise ActionError("'shell' must be powershell or cmd")
         a.admin = bool(data.get("admin", False))
+    if kind == "run":
+        a.command = str(data.get("command") or data.get("cmd") or "").strip()
+        if not a.command:
+            raise ActionError("'command' is empty")
+        if "timeout" in data:
+            a.timeout = min(max(_number(data, "timeout"), 5.0), 1800.0)
     if kind == "wait":
-        a.seconds = min(max(_number(data, "seconds"), 0.5), 120.0)
-    if kind in ("ask_user", "done", "fail"):
-        key = {"ask_user": "question", "done": "summary", "fail": "reason"}[kind]
+        a.seconds = min(max(_number(data, "seconds"), 1.0), 600.0)
+    if kind in ("ask_operator", "ask_enduser", "done", "fail"):
+        key = {"done": "summary", "fail": "reason"}.get(kind, "question")
         a.text = str(data.get(key) or data.get("text") or "").strip()
-        if kind == "ask_user" and not a.text:
+        if kind.startswith("ask") and not a.text:
             raise ActionError("'question' is empty")
     return a
 
@@ -198,7 +224,7 @@ def is_dangerous_text(text: str) -> bool:
 
 
 def needs_confirmation(action: Action, mode: str, last_typed: str = "") -> bool:
-    if action.type in ("ask_user", "done", "fail", "wait"):
+    if action.type in ("ask_operator", "ask_enduser", "done", "fail", "wait", "screenshot"):
         return False
     if mode == "all":
         return True
@@ -207,6 +233,8 @@ def needs_confirmation(action: Action, mode: str, last_typed: str = "") -> bool:
     if action.risky:
         return True
     if action.type == "open_terminal" and action.admin:
+        return True
+    if action.type == "run" and is_dangerous_text(action.command):
         return True
     if action.type == "type" and is_dangerous_text(action.text):
         return True
