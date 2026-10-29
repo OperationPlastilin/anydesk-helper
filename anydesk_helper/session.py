@@ -56,9 +56,11 @@ class Session:
 
     def ask(self, kind: str, text: str, **data) -> str:
         pid = next(self._ids)
-        self.pending = {"id": pid, "kind": kind, "text": text, "data": data}
-        self.event("ask", text, ask_kind=kind, ask_id=pid, **data)
+        # Порядок важен: статус и событие — до публикации вопроса. Иначе веб видит вопрос при старом
+        # статусе, техник успевает ответить, и статус потом «перескакивает» обратно на «ждёт ответа».
         self.status("waiting")
+        self.event("ask", text, ask_kind=kind, ask_id=pid, **data)
+        self.pending = {"id": pid, "kind": kind, "text": text, "data": data}
         # Звук слышен, даже если вкладка браузера закрыта. В отдельном потоке: MessageBeep без
         # звуковой карты (RDP, сервер) может надолго зависнуть, а ответ техника ждать не должен.
         threading.Thread(target=_safe_call, args=(self.m.alert,), name="alert", daemon=True).start()

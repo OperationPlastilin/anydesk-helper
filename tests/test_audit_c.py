@@ -368,3 +368,22 @@ def test_own_instance_on_non_http_port():
 
         threading.Thread(target=banner, daemon=True).start()
         assert main_mod.own_instance(port, "x" * 32) is False  # BadStatusLine -> чужая программа
+
+
+def test_question_is_published_after_waiting_status(tmp_path):
+    # Кто видит вопрос (pending), тот уже видит статус «ждёт ответа» и событие ask.
+    m = manager(tmp_path)
+    t = m.db.create_ticket("x")
+    s = Session(m, t)
+    seen = {}
+
+    def answer_when_visible():
+        while not s.pending:
+            time.sleep(0.001)
+        seen["status"] = m.db.get_ticket(t["id"])["status"]
+        seen["ask_logged"] = any(e["kind"] == "ask" for e in m.db.events(t["id"]))
+        s.answer(s.pending["id"], "да")
+
+    threading.Thread(target=answer_when_visible, daemon=True).start()
+    assert s.ask("question", "Какой принтер?") == "да"
+    assert seen == {"status": "waiting", "ask_logged": True}
