@@ -1,0 +1,8 @@
+keywords: эцп, кэп, криптопро, крипто про, cryptopro, crypto pro, рутокен, rutoken, etoken, jacarta, джакарта, токен, сертификат, электронная подпис, электронной подпис, электронную подпис
+ЭЦП / КриптоПро. Сначала диагностика только чтением, в обычной консоли пользователя (в админской под другой учёткой Cert:\CurrentUser чужой).
+- Нельзя: экспортировать или копировать закрытые ключи и контейнеры, удалять сертификаты и контейнеры — только по прямому указанию техника (ask_operator). PIN не спрашивай и не вводи: его вводит сам пользователь или техник.
+- Сертификаты: `Get-ChildItem Cert:\CurrentUser\My | select @{n='Name';e={$_.GetNameInfo('SimpleName',$false)}},NotAfter,HasPrivateKey,Thumbprint`. NotAfter в прошлом — сертификат истёк (нужен новый, скажи оператору); HasPrivateKey False — сертификат не связан с ключом (установить его из контейнера через КриптоПро CSP).
+- Программы и версии: `Get-ItemProperty HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*,HKLM:\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\* -EA 0 | ? DisplayName -match 'КриптоПро|Crypto.?Pro|Рутокен|Rutoken|JaCarta' | select DisplayName,DisplayVersion`.
+- Контейнеры: `& "$env:ProgramFiles\Crypto Pro\CSP\csptest.exe" -keyset -enum_cont -fqcn -verifyc`.
+- Токен виден системе: `Get-PnpDevice -PresentOnly -EA 0 | ? {$_.Class -match 'SmartCard' -or $_.FriendlyName -match 'Rutoken|JaCarta|eToken'} | select FriendlyName,Status; Get-Service SCardSvr,CertPropSvc | select Name,Status,StartType`. Не виден — другой USB-порт (ask_enduser), драйвер токена.
+- Сайты (госуслуги, ФНС, банки, СБИС, Контур): нужен «КриптоПро ЭЦП Browser plug-in» (виден в списке программ) и его расширение в браузере.

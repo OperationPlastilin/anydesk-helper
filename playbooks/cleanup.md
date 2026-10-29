@@ -1,0 +1,9 @@
+keywords: тормоз, медлен, долго загруж, долго включ, долго запуска, мало мест, нет мест, места на диск, место на диск, освободить мест, свободного мест, диск заполн, заполнен диск, автозагруз, slow, disk space, low disk
+Тормозит ПК / мало места на диске. Ничего не удаляй, пока не понял, что занимает место.
+- Нагрузка и память: `Get-Process | sort CPU -Desc | select -First 10 Name,CPU,@{n='MB';e={[int]($_.WS/1MB)}}; Get-CimInstance Win32_OperatingSystem | select @{n='FreeRAM_GB';e={[math]::Round($_.FreePhysicalMemory/1MB,1)}},@{n='RAM_GB';e={[math]::Round($_.TotalVisibleMemorySize/1MB,1)}},LastBootUpTime`.
+- Диски: `Get-PhysicalDisk | select FriendlyName,MediaType,HealthStatus; Get-CimInstance Win32_LogicalDisk -Filter DriveType=3 | select DeviceID,@{n='FreeGB';e={[math]::Round($_.FreeSpace/1GB,1)}},@{n='SizeGB';e={[math]::Round($_.Size/1GB,1)}}`. HealthStatus не Healthy — скажи оператору (диск пора менять).
+- Автозагрузка: `Get-CimInstance Win32_StartupCommand | select Name,Command,Location`; отключать — только после ask_enduser (risky).
+- Размеры папок (не делай -Recurse по всему диску — это минуты): `foreach($p in "$env:TEMP",'C:\Windows\Temp','C:\Windows\SoftwareDistribution\Download',"$env:USERPROFILE\Downloads"){'{0}: {1:N1} GB' -f $p,((Get-ChildItem $p -Recurse -Force -File -EA 0 | Measure-Object Length -Sum).Sum/1GB)}`.
+- Очистка (risky): временные файлы `Remove-Item "$env:TEMP\*",'C:\Windows\Temp\*' -Recurse -Force -EA 0` (занятые пропускаются); корзина `Clear-RecycleBin -Force -EA 0`; хранилище компонентов (админ, timeout 1800): `Dism /Online /Cleanup-Image /StartComponentCleanup`.
+- Загрузки, Рабочий стол, Документы и почту пользователя сам не удаляй — только по его ответу (ask_enduser).
+- LastBootUpTime давно (при «быстром запуске» «Завершение работы» не перезапускает систему) — предложи перезагрузку (ask_enduser, risky).

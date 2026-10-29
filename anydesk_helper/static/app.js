@@ -41,8 +41,17 @@ async function api(path, { method = "GET", body } = {}) {
   });
   if (resp.status === 401) { location.reload(); throw new Error("Сессия устарела"); }
   const data = resp.headers.get("Content-Type")?.includes("json") ? await resp.json() : await resp.text();
-  if (!resp.ok) throw new Error((data && data.error) || `Ошибка ${resp.status}`);
+  if (!resp.ok) throw Object.assign(new Error((data && data.error) || `Ошибка ${resp.status}`), { status: resp.status });
   return data;
+}
+
+// Меняет разметку, только если она другая: опрос раз в 1,5–4 с иначе сбрасывает выделение
+// текста и «съедает» клик, если кнопку заменили между нажатием и отпусканием.
+function setHTML(el, html) {
+  if (el._html === html) return false;
+  el._html = html;
+  el.innerHTML = html;
+  return true;
 }
 
 let toastTimer;
@@ -81,6 +90,72 @@ const S = {
 async function loadState() {
   S.state = await api("/api/state");
   renderNavbar();
+  if (S.route) watchAsk().catch(() => {}); // до первого route() не знаем, какой тикет открыт
+}
+
+/* ---------------------------------------------------------------- сигнал «ИИ ждёт ответа» */
+
+// Обычно поверх браузера окно AnyDesk: без звука и уведомления вопрос может висеть час.
+// Звук и уведомления браузер разрешает только после действия пользователя — включаем по клику.
+let audioCtx = null;
+function unlockAlerts(askPermission = false) {
+  try {
+    audioCtx ??= new AudioContext();
+    if (audioCtx.state === "suspended") audioCtx.resume();
+  } catch { /* нет WebAudio */ }
+  try {
+    if (askPermission && window.Notification?.permission === "default") Notification.requestPermission();
+  } catch { /* нет уведомлений */ }
+}
+
+function beep() {
+  if (audioCtx?.state !== "running") return;
+  const osc = audioCtx.createOscillator();
+  const gain = audioCtx.createGain();
+  osc.frequency.value = 880;
+  gain.gain.value = 0.15;
+  osc.connect(gain).connect(audioCtx.destination);
+  osc.start();
+  osc.stop(audioCtx.currentTime + 0.15);
+}
+
+const seenAsks = new Set();
+// Показанное уведомление о вопросе: { tid, n }. Новое с тем же tag браузер подменяет молча
+// (без звука и всплывания), поэтому старое закрываем сами и просим renotify.
+let askNote = null;
+function closeAskNote(tid) {
+  if (!askNote || (tid !== undefined && askNote.tid !== tid)) return;
+  try { askNote.n.close(); } catch { /* уже закрыто */ }
+  askNote = null;
+}
+
+function notifyAsk(tid, ask) {
+  const key = `${tid}:${ask.id}`;
+  if (seenAsks.has(key)) return; // каждый вопрос — один сигнал
+  seenAsks.add(key);
+  closeAskNote(); // прежний вопрос уже снят: его уведомление устарело
+  if (document.hasFocus() && S.ticketId === tid) return; // техник и так смотрит на вопрос
+  try {
+    beep();
+    if (window.Notification?.permission !== "granted") return;
+    const n = new Notification(`Тикет #${tid}: ${ASK_LABEL[ask.kind] || "Вопрос"}`,
+      { body: String(ask.text || "").slice(0, 200), tag: "aih-ask", renotify: true, requireInteraction: true });
+    askNote = { tid, n };
+    n.onclick = () => { window.focus(); location.hash = `#/t/${tid}`; closeAskNote(tid); };
+  } catch { /* звук или уведомления недоступны */ }
+}
+
+// Вопрос активного сеанса: из /api/state (active_ask), а если сервер его не отдаёт — из тикета.
+// Открытый тикет сигналит (и снимает уведомление) сам из renderPending.
+async function watchAsk() {
+  const st = S.state;
+  if (!st.active_ticket) return closeAskNote(); // сеанс кончился — вопроса нет
+  if (st.active_ticket === S.ticketId) return;
+  let ask = st.active_ask;
+  if (ask === undefined && st.active_status === "waiting")
+    ask = (await api(`/api/tickets/${st.active_ticket}`)).session?.pending;
+  if (ask) notifyAsk(st.active_ticket, ask);
+  else closeAskNote(); // на вопрос ответили (в этой или другой вкладке)
 }
 
 function renderNavbar() {
@@ -99,10 +174,11 @@ function renderNavbar() {
   // живой статус агента
   const w = $("#agent-widget");
   const line = $("#run-line");
+  const waiting = st.active_status === "waiting";
+  let html;
   if (st.active_ticket) {
-    const waiting = st.active_status === "waiting";
     const paused = st.active_status === "paused";
-    w.innerHTML = `<div class="session ${waiting ? "waiting" : ""}">
+    html = `<div class="session ${waiting ? "waiting" : ""}">
       <span class="dot ${waiting || paused ? "wait" : "busy"}"></span>
       <a href="#/t/${st.active_ticket}">Тикет #${st.active_ticket}</a>
       <span class="muted status-text">${esc(STATUS[st.active_status] || "в работе")}</span>
@@ -111,21 +187,27 @@ function renderNavbar() {
       <button class="mini" data-nav-ctl="stop" title="Стоп">${ICON.stop}</button></div>`;
     line.className = "run-line on" + (waiting || paused ? " wait" : "");
   } else {
-    w.innerHTML = `<span class="idle"><span class="dot"></span>Агент свободен</span>`;
+    html = `<span class="idle"><span class="dot"></span>Агент свободен</span>`;
     line.className = "run-line";
   }
-  w.querySelectorAll("[data-nav-ctl]").forEach((b) =>
+  // Номер тикета есть в разметке: если она не изменилась, старые обработчики верны.
+  if (setHTML(w, html)) w.querySelectorAll("[data-nav-ctl]").forEach((b) =>
     b.addEventListener("click", () => control(b.dataset.navCtl, st.active_ticket)));
+  // Видно на вкладке, даже когда браузер за окном AnyDesk.
+  document.title = st.active_ticket && waiting ? `❓ Ждёт ответа · тикет #${st.active_ticket}` : "AnyDesk Helper";
 
   // модель
   const m = st.model || {};
   const name = (m.name || "модель не выбрана").split("/").pop();
-  $("#model-chip").innerHTML = `<span class="dot ${m.key ? "ok" : "bad"}"></span>🧠 ${esc(name)}${m.key ? "" : " · нет ключа"}`;
+  setHTML($("#model-chip"), `<span class="dot ${m.key ? "ok" : "bad"}"></span>🧠 ${esc(name)}${m.key ? "" : " · нет ключа"}`);
   $("#model-chip").title = m.key ? `Модель: ${m.name}` : "Не задан API-ключ — откройте настройки";
 
   const up = $("#update-chip");
-  if (st.update) { up.textContent = `⬆ v${st.update.version}`; up.classList.remove("hidden"); }
-  else up.classList.add("hidden");
+  if (st.update) {
+    up.textContent = st.installing ? "⏳ Обновление…" : `⬆ v${st.update.version}`;
+    up.title = st.installing ? "Скачиваю обновление… программа перезапустится" : "Доступно обновление";
+    up.classList.remove("hidden");
+  } else up.classList.add("hidden");
   $("#theme-btn").textContent = document.documentElement.dataset.theme === "light" ? "🌙" : "☀️";
 }
 
@@ -148,14 +230,14 @@ async function loadTickets() {
 function renderList() {
   const list = $("#ticket-list");
   if (!S.tickets.length) {
-    list.innerHTML = `<p class="muted small" style="padding:8px">Тикетов пока нет</p>`;
+    setHTML(list, `<p class="muted small" style="padding:8px">Тикетов пока нет</p>`);
     return;
   }
-  list.innerHTML = S.tickets.map((t) => `
+  setHTML(list, S.tickets.map((t) => `
     <a class="ticket-item ${t.id === S.ticketId ? "active" : ""}" href="#/t/${t.id}">
       <div class="row"><span class="title">${esc(t.title)}</span>${pill(t.status)}</div>
       <div class="meta">#${t.id} · ${esc(t.anydesk_id || "без AnyDesk")} · ${esc(date(t.updated_at))}</div>
-    </a>`).join("");
+    </a>`).join(""));
 }
 
 /* ================================================================== роутинг */
@@ -247,11 +329,14 @@ function viewNew() {
     </form></div>`;
   $("#new-form").addEventListener("submit", (e) => {
     e.preventDefault();
+    // Двойной клик или двойной Enter не создаст второй тикет: неактивная кнопка блокирует и Enter.
+    const btn = e.submitter || e.target.querySelector("[type=submit]");
+    btn.disabled = true;
     guarded(async () => {
       const t = await api("/api/tickets", { method: "POST", body: Object.fromEntries(new FormData(e.target)) });
       await loadTickets();
       location.hash = `#/t/${t.id}`;
-    });
+    }).finally(() => { btn.disabled = false; });
   });
 }
 
@@ -263,8 +348,17 @@ async function viewTicket(id) {
   S.planStep = null;
   S.pendingId = null;
   $("#main").innerHTML = `<p class="muted">Загрузка…</p>`;
-  const t = await guarded(() => api(`/api/tickets/${id}`));
-  if (!t || S.ticketId !== id) return;
+  let t;
+  try {
+    t = await api(`/api/tickets/${id}`);
+  } catch (e) {
+    if (S.ticketId !== id) return;
+    $("#main").innerHTML = `<div class="empty"><h2>Тикет #${id} не открылся</h2>
+      <p>${e.status === 404 ? "Такого тикета нет — возможно, он удалён." : esc(e.message)}</p>
+      <p><a class="btn" href="#/tickets">К списку тикетов</a></p></div>`;
+    return;
+  }
+  if (S.ticketId !== id) return;
   S.ticket = t;
   $("#main").innerHTML = `<div class="container">
     <div class="ticket-head">
@@ -296,7 +390,7 @@ async function viewTicket(id) {
 function renderTicketMeta() {
   const t = S.ticket;
   const sess = t.session || {};
-  $("#t-info").innerHTML = `
+  setHTML($("#t-info"), `
     <h1>${esc(t.title)}</h1>
     <div class="meta">
       <span class="mono">#${t.id}</span> ${pill(t.status)}
@@ -304,7 +398,7 @@ function renderTicketMeta() {
       <span>создан ${esc(date(t.created_at))}</span>
     </div>
     ${t.description ? `<p class="description">${esc(t.description)}</p>` : ""}
-    ${t.summary ? `<div style="margin-top:10px">${adm(t.status === "solved" ? "tip" : "note", "Итог", `<p>${esc(t.summary)}</p>`)}</div>` : ""}`;
+    ${t.summary ? `<div style="margin-top:10px">${adm(t.status === "solved" ? "tip" : "note", "Итог", `<p>${esc(t.summary)}</p>`)}</div>` : ""}`);
 
   const acts = [];
   if (sess.active) {
@@ -317,11 +411,12 @@ function renderTicketMeta() {
     acts.push(`<button class="btn ghost danger" id="delete-btn">Удалить</button>`);
   }
   acts.push(`<a class="btn ghost" href="/api/tickets/${t.id}/export?t=${encodeURIComponent(APP.token)}">⬇ Отчёт</a>`);
-  $("#t-actions").innerHTML = acts.join("");
-  $("#t-actions").querySelectorAll("[data-ctl]").forEach((b) =>
-    b.addEventListener("click", () => control(b.dataset.ctl, t.id)));
-  $("#edit-btn")?.addEventListener("click", showEdit);
-  $("#delete-btn")?.addEventListener("click", deleteTicket);
+  if (setHTML($("#t-actions"), acts.join(""))) { // id тикета есть в ссылке «Отчёт»
+    $("#t-actions").querySelectorAll("[data-ctl]").forEach((b) =>
+      b.addEventListener("click", () => control(b.dataset.ctl, t.id)));
+    $("#edit-btn")?.addEventListener("click", showEdit);
+    $("#delete-btn")?.addEventListener("click", deleteTicket);
+  }
 
   renderStartCard();
   renderPlan();
@@ -333,8 +428,9 @@ function renderStartCard() {
   const t = S.ticket;
   const card = $("#start-card");
   const busy = S.state.active_ticket && S.state.active_ticket !== t.id;
+  const installing = !!S.state.installing; // после обновления процесс перезапустится — сеанс не начать
   // Перерисовываем только при смене состояния — иначе сотрём введённый пароль.
-  const key = `${t.id}|${!!t.session?.active}|${busy}|${t.status === "new"}`;
+  const key = `${t.id}|${!!t.session?.active}|${busy}|${t.status === "new"}|${installing}`;
   if (card.dataset.key === key) return;
   card.dataset.key = key;
   if (t.session?.active) {
@@ -359,10 +455,12 @@ function renderStartCard() {
         <span class="hint">Необязательно. Без пароля пользователь сам примет подключение. Не сохраняется.</span>
         <input type="password" id="st-password" autocomplete="off">
       </label>
-      <button class="btn primary" id="st-start" ${busy ? "disabled" : ""}>▶ Запустить агента</button>
-      ${busy ? `<span class="muted small">Сейчас идёт сеанс по тикету #${S.state.active_ticket}</span>` : ""}
+      <button class="btn primary" id="st-start" ${busy || installing ? "disabled" : ""}>▶ Запустить агента</button>
+      ${installing ? `<span class="muted small">Скачиваю обновление… программа перезапустится</span>`
+        : busy ? `<span class="muted small">Сейчас идёт сеанс по тикету #${S.state.active_ticket}</span>` : ""}
     </div>`;
   $("#st-start").addEventListener("click", () => guarded(async () => {
+    unlockAlerts(true); // клик — жест пользователя: можно спросить про уведомления и включить звук
     await api(`/api/tickets/${t.id}/start`, {
       method: "POST",
       body: {
@@ -382,26 +480,27 @@ function renderStartCard() {
 
 function renderPlan() {
   const plan = S.ticket.plan || [];
-  $("#plan").innerHTML = plan.length
+  setHTML($("#plan"), plan.length
     ? `<ol class="plan-list">${plan.map((p, i) => {
         const n = i + 1;
         const cls = S.planStep === n ? "current" : (S.planStep && n < S.planStep ? "past" : "");
         return `<li class="${cls}">${esc(p)}</li>`;
       }).join("")}</ol>`
-    : `<p class="muted small" style="margin:0">ИИ составит план после запуска</p>`;
+    : `<p class="muted small" style="margin:0">ИИ составит план после запуска</p>`);
 }
 
 /* ---------------------------------------------------------------- вопрос ИИ */
 
 const ASK_LABEL = {
   question: "ИИ спрашивает", plan: "Подтвердите план", confirm: "Подтвердите действие",
-  done: "Задача решена?", fail: "ИИ не справляется", error: "Ошибка модели", pick_window: "Нужна помощь",
+  // error — и сбой модели, и окно AnyDesk не вышло на передний план: оба вопроса «повторить?»
+  done: "Задача решена?", fail: "ИИ не справляется", error: "Ошибка — повторить?", pick_window: "Нужна помощь",
 };
 
 function renderPending() {
   const box = $("#pending");
   const p = S.ticket.session?.pending;
-  if (!p) { box.innerHTML = ""; S.pendingId = null; return; }
+  if (!p) { box.innerHTML = ""; S.pendingId = null; closeAskNote(S.ticketId); return; }
   if (S.pendingId === p.id) return; // не стираем то, что техник уже печатает
   S.pendingId = p.id;
   const d = p.data || {};
@@ -448,6 +547,11 @@ function renderPending() {
         <button class="btn danger" data-btn="stop">Стоп</button>`;
   }
   const type = p.kind === "error" || p.kind === "fail" ? "danger" : p.kind === "done" ? "tip" : "warn";
+  // Техник печатает в другом поле (подсказка, поиск) — фокус не забираем, иначе следующие буквы
+  // и Enter уйдут в ответ (например, «Отклонить с подсказкой»). Считаем до замены разметки.
+  const a = document.activeElement;
+  const typing = !!a && !box.contains(a) &&
+    a.matches("textarea, select, input:not([type=checkbox]):not([type=radio])");
   box.innerHTML = `<div class="adm ${type} pending">
       <div class="adm-title">${ADM_ICON[type]} ${esc(ASK_LABEL[p.kind] || "Вопрос")}</div>
       ${p.kind === "confirm" && d.command ? "" : `<div class="q">${esc(p.text)}</div>`}
@@ -463,16 +567,30 @@ function renderPending() {
       answer(p.id, text || "", false);
     }));
   const input = $("#ans-text");
+  const yes = box.querySelector('[data-btn="yes"]');
+  // Фокус на «да» ставим мы, а не техник: удержанный Enter (автоповтор) или дребезг в первые
+  // 300 мс не должен нажать её — одобряет только новое, отдельное нажатие.
+  let armedAt = 0;
+  const focusYes = () => { yes.focus(); armedAt = Date.now() + 300; };
+  yes?.addEventListener("keydown", (e) => {
+    if (e.key === "Enter" && (e.repeat || Date.now() < armedAt)) e.preventDefault();
+  });
+  // Без поля ввода (error, pick_window) фокус на зелёной кнопке: Enter/пробел нажмут её.
+  if (!typing) { if (input) input.focus(); else if (yes) focusYes(); }
   if (input) {
-    input.focus();
+    const enter = input.tagName === "INPUT" ? "Enter" : "Ctrl+Enter";
+    if (yes) input.title = `Пустое поле: ${enter} — перейти к «${yes.textContent.trim()}», ещё Enter — нажать`;
     input.addEventListener("keydown", (e) => {
       if (e.key === "Enter" && ((!e.shiftKey && input.tagName === "INPUT") || e.ctrlKey)) {
         e.preventDefault();
-        box.querySelector("[data-send]")?.click();
+        // Пустое поле: только переводим фокус на «да» — одобряет второй, осознанный Enter.
+        if (!input.value.trim() && yes) focusYes();
+        else box.querySelector("[data-send]")?.click();
       }
     });
   }
-  box.scrollIntoView({ block: "nearest" });
+  if (!typing) box.scrollIntoView({ block: "nearest" });
+  notifyAsk(S.ticketId, p);
 }
 
 async function answer(askId, value, button) {
@@ -556,8 +674,11 @@ async function refreshTicket() {
 
 async function pollEvents() {
   const id = S.ticketId;
-  const events = await api(`/api/tickets/${id}/events?after=${S.lastEventId}`);
-  if (id !== S.ticketId || !$("#timeline")) return;
+  const after = S.lastEventId;
+  const events = await api(`/api/tickets/${id}/events?after=${after}`);
+  // Опросы идут параллельно (таймер, подсказка, ответ): если другой уже дорисовал события
+  // или тикет открыли заново, этот ответ устарел — иначе история задвоится.
+  if (id !== S.ticketId || after !== S.lastEventId || !$("#timeline")) return;
   const tl = $("#timeline");
   const main = $("#main");
   const nearBottom = main.scrollHeight - main.scrollTop - main.clientHeight < 200;
@@ -587,6 +708,15 @@ function lessonList(lessons) {
   return `<ul class="lesson-links">${(lessons || []).map((l) =>
     `<li>${kindPill(l.kind)} <a href="#/kb?id=${l.id}">${esc(l.title)}</a></li>`).join("")}</ul>`;
 }
+
+// Статусы CommandResult из bridge.py (кроме done — там код возврата).
+const CMD_FOOT = {
+  running: "выполняется…",
+  busy: "не отправлена: предыдущая команда ещё выполняется",
+  refused: "отклонена: консоль на компьютере техника",
+  no_ack: "консоль не ответила",
+};
+const CMD_WAIT = new Set(["running", "busy"]); // не ошибка: результат будет или команду повторят
 
 function renderEvent(e) {
   const d = e.data || {};
@@ -632,7 +762,7 @@ function renderEvent(e) {
     case "command": {
       const status = d.status === "done"
         ? `<span class="${d.exit_code ? "exit-bad" : "exit-ok"}">код ${esc(d.exit_code ?? "?")}</span>`
-        : d.status === "running" ? `<span>выполняется…</span>` : `<span class="exit-bad">консоль не ответила</span>`;
+        : `<span class="${CMD_WAIT.has(d.status) ? "" : "exit-bad"}">${esc(CMD_FOOT[d.status] || CMD_FOOT.no_ack)}</span>`;
       const out = (d.output || "").trim();
       return codeBlock(`${d.command || e.text}${out ? "\n\n" + out : ""}`,
         { title: `PowerShell · ${time(e.ts)}`, prompt: true, foot: status });
@@ -659,7 +789,8 @@ async function viewKnowledge() {
     </div>
     ${adm("tip", "Как агент учится", `<p>После сеанса ИИ разбирает ход решения и записывает 0–3 урока: <b>рецепт</b> (что сработало),
       <b>ошибка → решение</b> (какая команда упала и что помогло), <b>не делать</b> (что не сработало или вы отклонили).
-      Похожие уроки сливаются, а те, что чаще помогают, поднимаются выше. Уроки можно править, отключать и передавать коллегам через экспорт.</p>`)}
+      Похожие уроки сливаются, а те, что чаще помогают, поднимаются выше. Уроки можно править, отключать и передавать коллегам через экспорт.
+      Урок со ссылкой или загрузкой кода из сети агент сохраняет отключённым — проверьте решение и включите его.</p>`)}
     <div id="kb-form" class="hidden" style="margin-top:16px"></div>
     <div class="kb-tools" style="margin-top:16px">
       <input type="search" id="kb-q" placeholder="Поиск: ошибка, программа, симптом…">
@@ -690,7 +821,7 @@ async function loadLessons(focus = 0) {
   S.lessons = lessons;
   $("#lessons").innerHTML = lessons.length ? lessons.map((l) => `
     <article class="lesson ${l.enabled ? "" : "off"}" id="lesson-${l.id}">
-      <div class="top">${kindPill(l.kind)}<h3>${esc(l.title)}</h3>
+      <div class="top">${kindPill(l.kind)}${l.enabled ? "" : `<span class="pill off" title="Агент не подсказывает этот урок, пока вы его не включите">отключён · на проверке</span>`}<h3>${esc(l.title)}</h3>
         <button class="btn sm ghost" data-edit="${l.id}">Изменить</button>
         <button class="btn sm ghost" data-toggle="${l.id}">${l.enabled ? "Отключить" : "Включить"}</button>
         <button class="btn sm ghost danger" data-del="${l.id}">Удалить</button></div>
@@ -757,7 +888,6 @@ function lessonForm(l) {
 
 async function viewSettings() {
   const { settings: s, presets } = await api("/api/settings");
-  const preset = presets[s.provider] || {};
   const sel = (v, cur) => (v === cur ? "selected" : "");
   $("#main").innerHTML = `<div class="narrow">
     <div class="page-head"><div><h1>Настройки</h1><p>Модель, поведение агента, AnyDesk и обновления.</p></div></div>
@@ -770,8 +900,7 @@ async function viewSettings() {
         </label>
         <label class="field">Адрес API<input name="base_url" value="${esc(s.base_url)}"></label>
         <label class="field">API-ключ
-          <span class="hint">${s.api_key_set ? `Ключ задан (${esc(s.api_key_hint)}). Оставьте поле пустым, чтобы не менять.` : "Ключ не задан."}
-            ${preset.key_url ? `<a href="${esc(preset.key_url)}" target="_blank" rel="noopener">Получить ключ →</a>` : ""}</span>
+          <span class="hint" id="key-hint"></span>
           <input name="api_key" type="password" autocomplete="off" placeholder="${s.api_key_set ? "••••••••" : "sk-..."}">
         </label>
         <label class="field">Модель
@@ -782,16 +911,26 @@ async function viewSettings() {
           </div>
           <datalist id="models"></datalist>
         </label>
+        <label class="field">Запасная модель
+          <span class="hint">Используется, когда закончился дневной лимит бесплатной модели. Пусто — не переключаться.</span>
+          <input name="fallback_model" list="models" value="${esc(s.fallback_model || "")}" placeholder="необязательно">
+        </label>
         <div class="form-row">
           <label class="check"><input type="checkbox" name="vision" ${s.vision ? "checked" : ""}> Скриншоты и мышь</label>
           <label class="check"><input type="checkbox" name="json_mode" ${s.json_mode ? "checked" : ""}> Строгий JSON-режим API</label>
         </div>
-        <label class="field">Формат координат
-          <select name="coords">
-            <option value="pixels" ${sel("pixels", s.coords)}>Пиксели (Qwen2.5-VL, qwen-vl-max)</option>
-            <option value="norm1000" ${sel("norm1000", s.coords)}>0..1000 (Qwen3-VL)</option>
-          </select>
-        </label>
+        <div class="form-row">
+          <label class="field">Формат координат
+            <select name="coords">
+              <option value="pixels" ${sel("pixels", s.coords)}>Пиксели (Qwen2.5-VL, qwen-vl-max)</option>
+              <option value="norm1000" ${sel("norm1000", s.coords)}>0..1000 (Qwen3-VL)</option>
+            </select>
+          </label>
+          <label class="field">Лимит ответа, токенов
+            <span class="hint">Обычно 4096. Thinking-моделям нужно 4000+; обрезанный ответ программа сама поднимет до 8192.</span>
+            <input name="max_tokens" type="number" min="64" max="131072" value="${esc(s.max_tokens)}">
+          </label>
+        </div>
         <div class="actions"><button type="button" class="btn" id="check-model">Проверить модель</button>
           <span class="muted small">сначала сохраните изменения</span></div>
         <pre class="report hidden" id="check-report"></pre>
@@ -830,7 +969,9 @@ async function viewSettings() {
         </label>
         <div class="form-row">
           <label class="field">Ждать подключения, сек<input name="connect_timeout" type="number" min="10" value="${s.connect_timeout}"></label>
-          <label class="field">Заголовок окна сеанса<input name="window_title" value="${esc(s.window_title)}" placeholder="авто по ID"></label>
+          <label class="field">Заголовок окна сеанса
+            <span class="hint">Пусто — найти по ID. Иначе — уникальная часть заголовка окна сеанса (ID или алиас), не «AnyDesk»</span>
+            <input name="window_title" value="${esc(s.window_title)}" placeholder="авто по ID"></label>
         </div>
       </section>
 
@@ -850,11 +991,23 @@ async function viewSettings() {
     </form></div>`;
 
   const form = $("#settings-form");
+  // Подсказка и ссылка «Получить ключ» — для выбранного в форме провайдера, а не сохранённого.
+  const keyHint = () => {
+    const p = presets[form.provider.value] || {};
+    const hint = s.api_key_hint ? ` (${esc(s.api_key_hint)})` : "";
+    $("#key-hint").innerHTML = (!s.api_key_set ? "Ключ не задан."
+      : form.provider.value !== s.provider
+        ? `<b>Сохранён ключ другого провайдера${hint} — вставьте ключ для нового.</b>`
+        : `Ключ задан${hint}. Оставьте поле пустым, чтобы не менять.`)
+      + (p.key_url ? ` <a href="${esc(p.key_url)}" target="_blank" rel="noopener">Получить ключ →</a>` : "");
+  };
+  keyHint();
   form.provider.addEventListener("change", () => {
     const p = presets[form.provider.value];
     if (p.base_url) form.base_url.value = p.base_url;
     if (p.model) form.model.value = p.model;
     form.coords.value = p.coords;
+    keyHint();
   });
   form.addEventListener("submit", (e) => {
     e.preventDefault();
@@ -870,9 +1023,12 @@ async function viewSettings() {
     });
   });
   $("#load-models").addEventListener("click", () => guarded(async () => {
+    // Список сервер берёт по сохранённым адресу и ключу — иначе покажет модели прежнего провайдера.
+    if (form.base_url.value.trim() !== s.base_url || form.api_key.value)
+      return toast("Сначала сохраните адрес API и ключ — список берётся из сохранённых настроек", true);
     const models = await api("/api/settings/models", { method: "POST" });
     $("#models").innerHTML = models.map((m) =>
-      `<option value="${esc(m.id)}">${m.vision ? "👁 " : ""}${m.free ? "бесплатно" : ""}</option>`).join("");
+      `<option value="${esc(m.id)}">${m.vision === true ? "👁 " : ""}${m.free === true ? "бесплатно" : ""}</option>`).join("");
     toast(`Моделей: ${models.length}. Начните вводить «qwen» в поле модели`);
   }));
   $("#check-model").addEventListener("click", () => guarded(async () => {
@@ -887,11 +1043,23 @@ async function viewSettings() {
     renderNavbar();
     showUpdate(S.state, true);
   }));
-  $("#upd-install").addEventListener("click", () => guarded(async () => {
-    const r = await api("/api/update/install", { method: "POST" });
-    toast(r.message);
-    setTimeout(waitForRestart, 3000);
-  }));
+  $("#upd-install").addEventListener("click", async (e) => {
+    // Запрос идёт, пока скачивается весь exe (до минуты): без этого кнопку жмут повторно.
+    const btn = e.currentTarget;
+    const label = btn.textContent;
+    btn.disabled = true;
+    btn.textContent = "Скачиваю обновление…";
+    try {
+      const r = await api("/api/update/install", { method: "POST" });
+      btn.textContent = "Перезапуск…"; // кнопка остаётся неактивной до перезагрузки страницы
+      toast(r.message);
+      setTimeout(() => waitForRestart(APP.version), 3000);
+    } catch (err) {
+      btn.disabled = false;
+      btn.textContent = label;
+      toast(err.message, true);
+    }
+  });
   if (S.state.update) showUpdate(S.state);
 }
 
@@ -901,23 +1069,38 @@ function showUpdate(st, checked = false) {
   if (!text) return;
   text.classList.remove("hidden");
   if (st.update_error) text.textContent = "Ошибка проверки: " + st.update_error;
-  else if (st.update) {
+  else if (st.update && st.installing) {
+    text.textContent = "Скачиваю обновление… программа перезапустится";
+    btn.disabled = true; // скачивание уже идёт (из другой вкладки)
+    btn.textContent = "Скачиваю обновление…";
+    btn.classList.remove("hidden");
+  } else if (st.update) {
     text.textContent = `Доступна версия ${st.update.version}. ${st.update.notes || ""}`;
-    if (st.frozen) { btn.textContent = `Обновить до ${st.update.version}`; btn.classList.remove("hidden"); }
-    else text.textContent += " (из исходников обновляйтесь через git pull)";
+    if (st.frozen) {
+      btn.disabled = false;
+      btn.textContent = `Обновить до ${st.update.version}`;
+      btn.classList.remove("hidden");
+    } else text.textContent += " (из исходников обновляйтесь через git pull)";
   } else if (checked) text.textContent = "У вас последняя версия.";
 }
 
-async function waitForRestart() {
+// Старый процесс ещё может отвечать, пока не завершился, а «/» без токена отвечает 401 без
+// исключения. Поэтому спрашиваем /api/state с токеном и перезагружаемся, когда отвечает уже
+// новый процесс: другая версия или сервер успел пропасть (замена exe не удалась — старая версия).
+async function waitForRestart(oldVersion, wentDown = false, tries = 0) {
   try {
-    await fetch("/", { cache: "no-store" });
-    location.reload();
-  } catch { setTimeout(waitForRestart, 2000); }
+    const resp = await fetch("/api/state", { cache: "no-store", headers: { "X-Token": APP.token } });
+    const st = resp.ok ? await resp.json() : null;
+    if (st && (st.version !== oldVersion || wentDown)) return location.reload();
+  } catch { wentDown = true; }
+  if (tries >= 90) return location.reload(); // ~3 минуты: дальше пусть техник видит, что есть
+  setTimeout(() => waitForRestart(oldVersion, wentDown, tries + 1), 2000);
 }
 
 /* ================================================================== запуск */
 
 document.addEventListener("click", (e) => {
+  unlockAlerts(); // после перезагрузки страницы звук снова разрешается только по клику
   const img = e.target.closest(".ev-step img");
   if (img) {
     $("#lightbox img").src = img.src;

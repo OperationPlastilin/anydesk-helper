@@ -20,8 +20,16 @@ CANDIDATE_PATHS = [
     "/usr/bin/anydesk",
     "/Applications/AnyDesk.app/Contents/MacOS/AnyDesk",
 ]
-# Окна, которые нельзя принять за окно сеанса (наша же консоль и т.п.).
-CONSOLE_WORDS = ("python", "anydesk_helper", "cmd.exe", "powershell", "terminal", "ai helper")
+# Окна, которые нельзя принять за окно сеанса: наша консоль «AnyDesk Helper», вкладка
+# браузера с веб-интерфейсом «AnyDesk Helper - Google Chrome» и т.п.
+CONSOLE_WORDS = ("python", "anydesk_helper", "anydesk helper", "cmd.exe", "powershell", "terminal",
+                 "ai helper")
+# Win32: см. WindowTarget.focus.
+SW_RESTORE, VK_MENU, KEYEVENTF_KEYUP = 9, 0x12, 0x0002
+
+
+class FocusError(RuntimeError):
+    """Окно сеанса AnyDesk не удалось вывести на передний план — вводить ничего нельзя."""
 
 
 def normalize_address(address: str) -> str:
@@ -88,9 +96,10 @@ class ScreenTarget:
 class WindowTarget:
     """Окно сеанса AnyDesk. Область пересчитывается каждый шаг: окно могут двигать."""
 
-    def __init__(self, window):
+    def __init__(self, window, sleep=time.sleep):
         self.window = window
         self.title = window.title
+        self.sleep = sleep
 
     def region(self) -> Region:
         w = self.window
@@ -104,14 +113,50 @@ class WindowTarget:
         return Region(left, top, right - left, bottom - top)
 
     def focus(self) -> None:
-        try:
-            if self.window.isMinimized:
-                self.window.restore()
-            self.window.activate()
-        except Exception:
-            # pygetwindow на Windows иногда бросает исключение, хотя окно активировалось.
-            pass
-        time.sleep(0.2)
+        """Выводит окно сеанса на передний план и ПРОВЕРЯЕТ это (GetForegroundWindow).
+        Windows отдаёт передний план только процессу, от которого был последний ввод, а его
+        обычно забирает клик техника в браузере. Не вышло — FocusError, а не ввод вслепую."""
+        u = _user32()
+        if not u.IsWindow(self.window._hWnd) and not self._rebind(u):
+            raise FocusError(f"Окно сеанса AnyDesk «{self.title}» закрыто. Переподключитесь к "
+                             "пользователю (окно с тем же заголовком) и повторите — или "
+                             "остановите и запустите сеанс заново")
+        hwnd = self.window._hWnd
+        for attempt in range(3):
+            if not u.IsWindow(hwnd):
+                raise FocusError("Окно сеанса AnyDesk закрылось — переподключитесь и повторите")
+            if u.GetForegroundWindow() == hwnd:
+                return
+            if u.IsIconic(hwnd):
+                u.ShowWindow(hwnd, SW_RESTORE)
+            if attempt:
+                # Нажатие Alt делает нас «последним вводом» и снимает запрет. Нажимаем и
+                # отпускаем ДО переключения, чтобы отпускание Alt не ушло через AnyDesk.
+                u.keybd_event(VK_MENU, 0, 0, 0)
+                u.keybd_event(VK_MENU, 0, KEYEVENTF_KEYUP, 0)
+            u.SetForegroundWindow(hwnd)
+            self.sleep(0.2)
+        if u.GetForegroundWindow() != hwnd:
+            raise FocusError("Не удалось вывести окно AnyDesk на передний план — кликните по нему")
+
+    def _rebind(self, u) -> bool:
+        """Окно сеанса закрылось (пользователь отключился, перезагрузка) — после переподключения
+        AnyDesk открывает новое окно с тем же заголовком. Берём его, только если оно одно и
+        заголовок не общий («AnyDesk» — это и главное окно AnyDesk на компьютере техника)."""
+        title = self.title.strip().lower()
+        if title in ("", "anydesk", "anydesk.exe") or any(word in title for word in CONSOLE_WORDS):
+            return False
+        found = [w for w in _windows() if w.title.strip().lower() == title and u.IsWindow(w._hWnd)]
+        if len(found) != 1:
+            return False
+        self.window = found[0]
+        return True
+
+
+def _user32():
+    import ctypes
+
+    return ctypes.windll.user32
 
 
 def _windows():
@@ -124,6 +169,9 @@ def _windows():
 
 def find_session_window(address: str, title_hint: str = ""):
     digits = normalize_address(address).lower()
+    title_hint = title_hint.strip()
+    if title_hint.lower() in ("anydesk", "anydesk.exe"):
+        title_hint = ""  # подходит к любому окну AnyDesk (и к главному) — ищем по ID
     for w in _windows():
         title = w.title.lower()
         if any(word in title for word in CONSOLE_WORDS):
@@ -133,16 +181,6 @@ def find_session_window(address: str, title_hint: str = ""):
             return w
         if not title_hint and digits and digits in squashed:
             return w
-    return None
-
-
-def wait_for_session(address: str, timeout: int, title_hint: str = ""):
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        window = find_session_window(address, title_hint)
-        if window:
-            return window
-        time.sleep(2)
     return None
 
 

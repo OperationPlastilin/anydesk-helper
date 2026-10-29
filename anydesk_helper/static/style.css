@@ -205,7 +205,7 @@ label.check { display: flex; align-items: center; gap: 8px; cursor: pointer; fon
 
 .pill { display: inline-block; padding: 0 9px; border-radius: 999px; font-size: 12px; font-weight: 600; line-height: 20px; white-space: nowrap; background: var(--surface-3); color: var(--muted); }
 .pill.running { background: var(--primary-soft); color: var(--primary); }
-.pill.waiting, .pill.paused { background: var(--warn-bg); color: var(--warn); }
+.pill.waiting, .pill.paused, .pill.off { background: var(--warn-bg); color: var(--warn); }
 .pill.solved { background: var(--tip-bg); color: var(--tip); }
 .pill.failed, .pill.stopped { background: var(--danger-bg); color: var(--danger); }
 .pill.k-solution { background: var(--tip-bg); color: var(--tip); }
@@ -287,7 +287,10 @@ label.check { display: flex; align-items: center; gap: 8px; cursor: pointer; fon
 .lesson-links { margin: 4px 0 0; padding-left: 18px; }
 .risky { background: var(--danger-bg); color: var(--danger); }
 
-.pending { position: sticky; bottom: 0; z-index: 2; box-shadow: 0 -10px 24px rgba(0,0,0,.25); display: grid; gap: 10px; }
+/* Липнет к низу экрана, пока видна лента: sticky на обёртке #pending, ведь .pending заполняет её целиком. */
+#pending { position: sticky; bottom: 0; z-index: 2; }
+.pending { box-shadow: 0 -10px 24px rgba(0,0,0,.25); display: grid; gap: 10px; }
+.pending .btn:focus-visible { outline: 2px solid var(--primary); outline-offset: 2px; }
 .pending .q { font-weight: 600; white-space: pre-wrap; font-size: 15px; }
 .pending textarea, .pending input { background: var(--bg); }
 
@@ -321,7 +324,8 @@ details pre { white-space: pre-wrap; word-break: break-word; font-size: 12px; ba
 
 @media (max-width: 1150px) {
   .ticket-grid { grid-template-columns: 1fr; }
-  .side-panel { position: static; }
+  /* Панель над лентой: низ страницы — снова последние события, и автопрокрутка следит за ними. */
+  .side-panel { position: static; order: -1; }
   .features, .stats { grid-template-columns: repeat(2, 1fr); }
   .model-chip { display: none; }
 }

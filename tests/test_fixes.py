@@ -63,12 +63,13 @@ def test_restore_state_and_resume():
     assert saved["notes"] == ["Q: Какая лицензия? A: M365", "ставь 64-бит"]
     assert saved["history"] == ["1. run: Get-Package *Office* -> done, exit 0: нет Office"]
 
-    replies = [{"action": "done", "summary": "ok"}]  # плана нет — сразу шаги
-    agent, llm, op, _ = make_agent(replies, [YES])
+    replies = [{"action": "done", "summary": "ok"}]  # план не составляется заново — сразу шаги
+    agent, llm, op, _ = make_agent(replies, [YES, YES])
     assert agent.run(saved) is True
     first = llm.requests[0][1]["content"]
     assert "M365" in first and "Get-Package" in first and "interrupted" in first
-    assert "question" not in [a[0] for a in op.asks]
+    # сохранённый план техник подтверждает заново: он мог быть так и не одобрен
+    assert [a[0] for a in op.asks] == ["plan", "done"]
 
 
 def test_cleanup_old_screenshots(tmp_path):
