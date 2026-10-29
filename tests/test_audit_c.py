@@ -34,8 +34,9 @@ def manager(tmp_path, factory=None, **settings):
 def wait_done(m, timeout=5):
     end = time.time() + timeout
     while m.current.alive and time.time() < end:
-        if m.current.pending:  # план и прочие вопросы — одобряем
-            m.current.answer(m.current.pending["id"], "yes")
+        pending = m.current.pending  # читаем один раз: вопрос могут снять между проверкой и чтением
+        if pending:  # план и прочие вопросы — одобряем
+            m.current.answer(pending["id"], "yes")
         time.sleep(0.02)
     assert not m.current.alive
 
@@ -116,12 +117,24 @@ def test_resume_method_is_not_shadowed(tmp_path):
     assert s.paused is False
 
 
+
+def answer_when_asked(session, value, timeout=10):
+    """Отвечает, как только вопрос опубликован (а не по таймеру: запись в базу на Windows медленнее)."""
+    def run():
+        end = time.monotonic() + timeout
+        while session.pending is None and time.monotonic() < end:
+            time.sleep(0.005)
+        if session.pending is not None:
+            session.answer(session.pending["id"], value)
+
+    threading.Thread(target=run, daemon=True).start()
+
 def test_ask_beeps_through_manager_hook(tmp_path):
     m = manager(tmp_path)
     beeped = threading.Event()
     m.alert = beeped.set
     s = Session(m, m.db.create_ticket("x"))
-    threading.Timer(0.05, lambda: s.answer(s.pending["id"], "да")).start()
+    answer_when_asked(s, "да")
     assert s.ask("question", "Какой принтер?") == "да" and beeped.wait(2)
 
 
@@ -131,7 +144,7 @@ def test_hanging_beep_does_not_delay_the_answer(tmp_path):
     release = threading.Event()
     m.alert = lambda: release.wait(10)
     s = Session(m, m.db.create_ticket("x"))
-    threading.Timer(0.05, lambda: s.answer(s.pending["id"], "да")).start()
+    answer_when_asked(s, "да")
     start = time.monotonic()
     assert s.ask("question", "Какой принтер?") == "да"
     assert time.monotonic() - start < 2
@@ -141,7 +154,7 @@ def test_hanging_beep_does_not_delay_the_answer(tmp_path):
         raise RuntimeError("нет звуковой карты")
 
     m.alert = broken  # сигнал не должен мешать вопросу
-    threading.Timer(0.05, lambda: s.answer(s.pending["id"], "нет")).start()
+    answer_when_asked(s, "нет")
     assert s.ask("question", "Ещё?") == "нет"
     session_mod.beep()  # вне Windows — ничего не делает и не падает
 
