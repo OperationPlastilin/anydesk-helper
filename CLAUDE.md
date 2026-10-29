@@ -35,9 +35,11 @@ AnyDeskHelper.exe (launcher.py -> anydesk_helper/__main__.py)
 ├─ static/ (index.html, app.js, style.css) — SPA на hash-роутинге: #/ #/tickets #/new #/t/ID #/kb #/settings
 │  └─ дизайн: тёмный docs-стиль (massgrave.dev/Docusaurus), admonitions .adm tip|info|warn|danger|note,
 │     кодблоки .code с «копировать», навбар: вкладки + виджет агента + модель + обновление + тема
-├─ session.py: SessionManager (один сеанс за раз) -> Session(thread) = «оператор» для агента
+├─ session.py: SessionManager (один сеанс за раз; при старте cleanup_files(keep_files_days)) -> Session(thread)
+│  ├─ Session = «оператор» для агента; resume=True -> restore_state(events) -> Agent.run(saved)
 │  └─ default_factory: окно AnyDesk (anydesk.py) + Controller + ConsoleBridge + LLM
-├─ agent.py: Agent.run() = prepare_console(проба) -> load_experience -> make_plan(вопросы, одобрение) -> loop
+├─ agent.py: Agent.run(resume) = prepare_console(проба) -> load_experience -> make_plan | resume -> loop
+│  ├─ StopSession во время команды -> cancel_command() = Ctrl+C в консоли пользователя
 │  ├─ handle(action): run/wait/open_terminal/ask_enduser/screenshot/GUI/ask_operator/done/fail
 │  ├─ known_fix(): команда упала -> поиск урока по тексту ошибки -> «KNOWN FROM EXPERIENCE»
 │  └─ learn(outcome): рефлексия LLM -> 0–3 урока -> knowledge.add (дедупликация)
@@ -48,7 +50,8 @@ AnyDeskHelper.exe (launcher.py -> anydesk_helper/__main__.py)
 ├─ db.py: SQLite tickets + events (data JSON); при старте running/waiting -> stopped
 ├─ llm.py: chat() (json_mode с откатом, ретраи 429/5xx), list_models()
 ├─ controller.py (pyautogui, ленивый импорт), screen.py (mss, стороны кратны 28 px), checks.py, report.py
-└─ config.py: Settings -> %LOCALAPPDATA%\AnyDeskHelper\settings.json; paths.py: data_dir/resource_dir
+└─ config.py: Settings -> %LOCALAPPDATA%\AnyDeskHelper\settings.json (api_key = "dpapi:<b64>", DPAPI
+   текущего пользователя; не расшифровался -> пусто); paths.py: data_dir/resource_dir
 ```
 
 ## Ключевые контракты
@@ -64,6 +67,8 @@ AnyDeskHelper.exe (launcher.py -> anydesk_helper/__main__.py)
 - **Мост**: строка-обёртка (одна, ASCII) → base64-команда → `Write-Host 'AI> …'`, `Set-Clipboard 'AIH-RUN-<id>'`,
   dot-source ScriptBlock `*>&1 | Tee-Object` → `Set-Clipboard "AIH-END-<id> exit=N`n<вывод>"`.
   Нет START за 10 с → `no_ack` (консоль не в фокусе → скриншот). Переменные живут между командами.
+- **Таймаут команды**: `Action.timeout=None` → `settings.command_timeout`; модель может задать свой (5–1800).
+- **Продолжение**: restore_state берёт из событий план, Q/A, подсказки и историю шагов, план заново не строится.
 - **GUI-клики** разрешены, только если в этом шаге был скриншот (`parse_action(img_w=0)` → ошибка).
 - **Опыт**: search min_score 0.2, дедупликация по title+problem ≥ 0.5 того же kind; wins += 1, если
   тикет с использованным уроком решён; solution из нерешённого тикета → pitfall; scrub убирает email, ключи, пароли.

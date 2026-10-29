@@ -10,7 +10,7 @@ import traceback
 from pathlib import Path
 
 from . import anydesk
-from .agent import NO, STOP, YES, Agent, StopSession
+from .agent import NO, STOP, YES, Agent, StopSession, restore_state
 from .bridge import ConsoleBridge
 from .controller import Controller
 from .llm import LLM
@@ -23,7 +23,7 @@ class Session:
     _ids = itertools.count(1)
 
     def __init__(self, manager, ticket: dict, password: str = "", connect: bool = True,
-                 mode: str = "anydesk", dry_run: bool = False):
+                 mode: str = "anydesk", dry_run: bool = False, resume: bool = False):
         self.m = manager
         self.ticket = ticket
         self.tid = ticket["id"]
@@ -31,6 +31,7 @@ class Session:
         self.connect = connect
         self.mode = mode
         self.dry_run = dry_run
+        self.resume = resume  # продолжить по сохранённому плану, а не начинать заново
         self.pending: dict | None = None
         self._answers: queue.Queue = queue.Queue()
         self.paused = False
@@ -138,7 +139,8 @@ class Session:
             agent = Agent(settings, parts["llm"], parts["target"], parts["controller"],
                           parts["bridge"], self, self.ticket, playbook_dirs=self.m.playbook_dirs,
                           grab=parts.get("grab") or _default_grab(), sleep=self.sleep, kb=self.m.kb)
-            ok = agent.run()
+            saved = restore_state(self.m.db.events(self.tid)) if self.resume else None
+            ok = agent.run(saved)
             result_status = "solved" if ok else "failed"
         except StopSession:
             result_status = "stopped"
@@ -229,9 +231,28 @@ class SessionManager:
         self.data_dir = Path(data_dir)
         self.files_dir = self.data_dir / "files"
         self.files_dir.mkdir(parents=True, exist_ok=True)
+        self.cleanup_files(self.settings().keep_files_days)
         self.playbook_dirs = [self.data_dir / "playbooks", resource_dir() / "playbooks"]
         self.factory = factory
         self.current: Session | None = None
+
+    def cleanup_files(self, days: int, now: float | None = None) -> int:
+        """Удаляет скриншоты старше days дней (0 — хранить вечно). Возвращает число удалённых."""
+        if days <= 0:
+            return 0
+        limit = (now or time.time()) - days * 86400
+        removed = 0
+        for path in self.files_dir.glob("*/*.jpg"):
+            try:
+                if path.stat().st_mtime < limit:
+                    path.unlink()
+                    removed += 1
+            except OSError:
+                continue
+        for folder in self.files_dir.iterdir():
+            if folder.is_dir() and not any(folder.iterdir()):
+                folder.rmdir()
+        return removed
 
     def settings(self):
         return self.store.load()

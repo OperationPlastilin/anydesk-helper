@@ -41,7 +41,7 @@ class FakeRemote:
         self.clipboard = clipboard
         self.outputs = outputs or {}
         self.silent = silent  # консоль не в фокусе — ничего не происходит
-        self.running = running  # команда стартовала, но не закончилась
+        self.running = running  # команда стартовала, но не закончилась (bool или regex)
         self.commands = []
         self.terminals = []
         self.keys = []
@@ -55,7 +55,8 @@ class FakeRemote:
         cid = re.search(rf"'{START}(\w+)'", line).group(1)
         command = base64.b64decode(b64).decode("utf-8")
         self.commands.append(command)
-        if self.running:
+        # running=True — любая команда «зависает»; строка — только команды, подходящие под шаблон
+        if self.running is True or (isinstance(self.running, str) and re.search(self.running, command)):
             self.clipboard.text = START + cid
             return
         output, code = "", 0

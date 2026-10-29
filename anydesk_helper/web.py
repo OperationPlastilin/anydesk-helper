@@ -137,7 +137,8 @@ def create_app(db, store, manager, port: int, dev: bool = False, token: str | No
             raise ValueError("Не задан API-ключ модели (Настройки)")
         try:
             manager.start(tid, password=str(b.get("password", "")), connect=bool(b.get("connect", True)),
-                          mode=mode, dry_run=bool(dev and b.get("dry_run")))
+                          mode=mode, dry_run=bool(dev and b.get("dry_run")),
+                          resume=bool(b.get("resume") and t["plan"]))
         except RuntimeError as e:
             raise ValueError(str(e)) from None
         return jsonify(ok=True)

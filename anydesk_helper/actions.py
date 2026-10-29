@@ -59,7 +59,7 @@ class Action:
     y2: float | None = None
     text: str = ""  # текст для type, вопрос, итог или причина неудачи
     command: str = ""
-    timeout: float = 120.0
+    timeout: float | None = None  # None — таймаут из настроек (command_timeout)
     keys: list[str] = field(default_factory=list)
     amount: int = 0
     seconds: float = 0.0

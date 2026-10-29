@@ -343,14 +343,17 @@ function renderStartCard() {
       Аварийная остановка — мышь в левый верхний угол экрана.</p>`;
     return;
   }
+  const canResume = t.status !== "new" && t.status !== "solved" && (t.plan || []).length > 0;
   card.innerHTML = `
-    <h3>${t.status === "new" ? "Запуск агента" : "Запустить заново"}</h3>
+    <h3>${t.status === "new" ? "Запуск агента" : canResume ? "Продолжить работу" : "Запустить заново"}</h3>
     <div class="form">
       ${APP.dev ? `
         <label class="field">Режим
           <select id="st-mode"><option value="anydesk">AnyDesk</option><option value="local">Этот ПК (тест)</option></select>
         </label>
         <label class="check"><input type="checkbox" id="st-dry"> Без нажатий (dry-run)</label>` : ""}
+      ${canResume ? `<label class="check"><input type="checkbox" id="st-resume" checked> Продолжить по сохранённому плану
+        (${t.plan.length} пунктов, ответы и история сохранятся)</label>` : ""}
       <label class="check"><input type="checkbox" id="st-connect" checked> Подключиться к ${esc(t.anydesk_id || "?")} автоматически</label>
       <label class="field">Пароль неконтролируемого доступа
         <span class="hint">Необязательно. Без пароля пользователь сам примет подключение. Не сохраняется.</span>
@@ -367,6 +370,7 @@ function renderStartCard() {
         connect: $("#st-connect").checked,
         mode: $("#st-mode")?.value || "anydesk",
         dry_run: $("#st-dry")?.checked || false,
+        resume: $("#st-resume")?.checked || false,
       },
     });
     toast("Агент запущен");
@@ -807,6 +811,12 @@ async function viewSettings() {
           <label class="field">Максимум шагов<input name="max_steps" type="number" min="5" max="500" value="${s.max_steps}"></label>
         </div>
         <div class="form-row">
+          <label class="field">Таймаут команды, сек<span class="hint">Если ИИ не указал свой (установки — до 1800)</span>
+            <input name="command_timeout" type="number" min="5" max="1800" value="${s.command_timeout}"></label>
+          <label class="field">Хранить скриншоты, дней<span class="hint">Старые удаляются при запуске; 0 — хранить всегда</span>
+            <input name="keep_files_days" type="number" min="0" value="${s.keep_files_days}"></label>
+        </div>
+        <div class="form-row">
           <label class="check"><input type="checkbox" name="learning" ${s.learning ? "checked" : ""}> Самообучение после каждого сеанса</label>
           <label class="field">Уроков из базы в промт<input name="experience_limit" type="number" min="0" max="15" value="${s.experience_limit}"></label>
         </div>
@@ -827,7 +837,8 @@ async function viewSettings() {
       <section class="card form">
         <h2>⬆ Программа и обновления</h2>
         <label class="check"><input type="checkbox" name="auto_update" ${s.auto_update ? "checked" : ""}> Проверять обновления на GitHub при запуске</label>
-        <label class="field">Порт веб-интерфейса<input name="port" type="number" value="${s.port}"></label>
+        <label class="field">Порт веб-интерфейса<span class="hint">Новый порт заработает после перезапуска программы</span>
+          <input name="port" type="number" min="1024" max="65535" value="${s.port}"></label>
         <div class="actions">
           <span>Версия <b>${esc(APP.version)}</b></span>
           <button type="button" class="btn" id="upd-check">Проверить обновления</button>
@@ -851,7 +862,9 @@ async function viewSettings() {
       const data = Object.fromEntries(new FormData(form));
       for (const name of ["vision", "json_mode", "auto_update", "learning"]) data[name] = form[name].checked;
       await api("/api/settings", { method: "POST", body: data });
-      toast("Настройки сохранены");
+      toast(Number(data.port) !== s.port
+        ? `Сохранено. Порт ${data.port} заработает после перезапуска программы`
+        : "Настройки сохранены");
       await loadState();
       viewSettings();
     });

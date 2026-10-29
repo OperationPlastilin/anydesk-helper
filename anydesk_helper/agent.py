@@ -97,12 +97,35 @@ class Agent:
 
     # ------------------------------------------------------------ этапы
 
-    def run(self) -> bool:
-        self.op.event("info", "Открываю PowerShell на компьютере пользователя и собираю сведения о системе")
-        self.prepare_console()
-        self.load_experience()
-        self.make_plan()
-        return self.loop()
+    def run(self, resume: dict | None = None) -> bool:
+        """resume — сохранённые план, ответы и история прерванного сеанса (restore_state)."""
+        try:
+            self.op.event("info", "Открываю PowerShell на компьютере пользователя и собираю сведения о системе")
+            self.prepare_console()
+            self.load_experience()
+            if resume and resume.get("plan"):
+                self.resume(resume)
+            else:
+                self.make_plan()
+            return self.loop()
+        except StopSession:
+            self.cancel_command()
+            raise
+
+    def resume(self, saved: dict) -> None:
+        st = self.state
+        st.plan = list(saved["plan"])
+        st.notes += saved.get("notes", [])
+        st.history = list(saved.get("history", []))
+        st.last = ("The session was interrupted and has been restarted; the console was reopened. "
+                   "First check with a command what is already done, then continue the plan.")
+        self.op.event("plan", "Продолжаю по сохранённому плану", plan=st.plan, questions=[])
+
+    def cancel_command(self) -> None:
+        """Стоп во время долгой команды — прерываем её у пользователя (Ctrl+C в консоли)."""
+        if self.bridge.pending:
+            self.bridge.cancel()
+            self.op.event("info", "Выполнявшаяся команда прервана (Ctrl+C в консоли пользователя)")
 
     def load_experience(self) -> None:
         if not self.kb:
@@ -252,7 +275,7 @@ class Agent:
                 return self.remember(step, a, "REJECTED by technician" + (f", hint: {hint}" if hint else ""))
 
         if a.type == "run":
-            result = self.bridge.run(a.command, timeout=a.timeout)
+            result = self.bridge.run(a.command, timeout=a.timeout or self.s.command_timeout)
             self.log_command(a.command, result)
             text = result.for_model()
             if result.status == "done" and looks_like_error(result.output, result.exit_code):
@@ -377,6 +400,33 @@ class Agent:
     def check_stop(answer: str) -> None:
         if answer == STOP:
             raise StopSession
+
+
+def restore_state(events: list[dict]) -> dict:
+    """Восстанавливает из ленты тикета план, ответы техника и историю шагов —
+    чтобы продолжить сеанс после перезапуска программы, а не начинать заново."""
+    plan, notes, history, questions = [], [], [], {}
+    for e in events:
+        d, kind = e.get("data") or {}, e["kind"]
+        if kind == "plan" and d.get("plan"):
+            plan = d["plan"]
+        elif kind == "ask":
+            questions[d.get("ask_id")] = (d.get("ask_kind"), e["text"])
+        elif kind == "answer":
+            ask_kind, text = questions.get(d.get("ask_id"), (d.get("ask_kind"), ""))
+            value = d.get("value", "")
+            if ask_kind == "question":
+                notes.append(f"Q: {text} A: {value or '(no answer)'}")
+            elif ask_kind in ("plan", "done", "fail", "confirm") and value not in ("", YES, NO, STOP):
+                notes.append(value)
+        elif kind == "hint":
+            notes.append(e["text"])
+        elif kind == "step":
+            history.append(f"{d.get('step')}. {d.get('description', '')[:200]}")
+        elif kind == "command" and history:
+            out = (d.get("output") or "").strip().replace("\n", " ")
+            history[-1] += f" -> {d.get('status')}, exit {d.get('exit_code')}: {out[:150]}"
+    return {"plan": plan, "notes": notes, "history": history[-20:]}
 
 
 def _points(a: Action) -> list[tuple[float, float]]:

@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import base64
 import json
 import os
+import sys
 from dataclasses import asdict, dataclass, fields
 from pathlib import Path
 
@@ -61,6 +63,7 @@ class Settings:
     step_delay: float = 1.0
     screenshot_max_side: int = 1288
     command_timeout: int = 120
+    keep_files_days: int = 30  # скриншоты старше — удаляются при запуске (0 — хранить вечно)
     learning: bool = True  # после сеанса извлекать уроки в базу опыта
     experience_limit: int = 5  # сколько уроков из базы класть в промт
     # --- AnyDesk ---
@@ -119,6 +122,8 @@ class SettingsStore:
                 data = {}
             for key, value in validate(data).items():
                 setattr(s, key, value)
+        # Ключ зашифрован DPAPI: на другом ПК или под другим пользователем он не расшифруется — тогда пусто.
+        s.api_key = unprotect(s.api_key)
         if use_env and not s.api_key:
             s.api_key = os.environ.get("ANYDESK_HELPER_API_KEY", "")
         return s
@@ -135,5 +140,54 @@ class SettingsStore:
 
     def save(self, s: Settings) -> None:
         tmp = self.path.with_suffix(".tmp")
-        tmp.write_text(json.dumps(asdict(s), ensure_ascii=False, indent=2), encoding="utf-8")
+        data = asdict(s)
+        data["api_key"] = protect(data["api_key"])
+        tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
         tmp.replace(self.path)
+
+
+# ---------------------------------------------------------------- шифрование ключа (Windows DPAPI)
+
+DPAPI_PREFIX = "dpapi:"
+
+
+def dpapi_available() -> bool:
+    return sys.platform == "win32"
+
+
+def _dpapi(data: bytes, encrypt: bool) -> bytes:
+    import ctypes
+    from ctypes import wintypes
+
+    class Blob(ctypes.Structure):
+        _fields_ = [("cbData", wintypes.DWORD), ("pbData", ctypes.POINTER(ctypes.c_char))]
+
+    buf = ctypes.create_string_buffer(data, len(data))
+    blob_in = Blob(len(data), ctypes.cast(buf, ctypes.POINTER(ctypes.c_char)))
+    blob_out = Blob()
+    crypt32 = ctypes.windll.crypt32
+    fn = crypt32.CryptProtectData if encrypt else crypt32.CryptUnprotectData
+    if not fn(ctypes.byref(blob_in), None, None, None, None, 0x01, ctypes.byref(blob_out)):
+        raise OSError("DPAPI: не удалось обработать ключ")
+    try:
+        return ctypes.string_at(blob_out.pbData, blob_out.cbData)
+    finally:
+        ctypes.windll.kernel32.LocalFree(ctypes.cast(blob_out.pbData, ctypes.c_void_p))
+
+
+def protect(secret: str) -> str:
+    """Шифрует API-ключ для settings.json. Вне Windows хранит как есть."""
+    if not secret or secret.startswith(DPAPI_PREFIX) or not dpapi_available():
+        return secret
+    return DPAPI_PREFIX + base64.b64encode(_dpapi(secret.encode("utf-8"), encrypt=True)).decode("ascii")
+
+
+def unprotect(value: str) -> str:
+    if not value.startswith(DPAPI_PREFIX):
+        return value  # старый файл с открытым ключом — зашифруется при следующем сохранении
+    if not dpapi_available():
+        return ""
+    try:
+        return _dpapi(base64.b64decode(value[len(DPAPI_PREFIX):]), encrypt=False).decode("utf-8")
+    except (OSError, ValueError):
+        return ""
