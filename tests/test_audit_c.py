@@ -118,11 +118,24 @@ def test_resume_method_is_not_shadowed(tmp_path):
 
 def test_ask_beeps_through_manager_hook(tmp_path):
     m = manager(tmp_path)
-    beeps = []
-    m.alert = lambda: beeps.append(1)
+    beeped = threading.Event()
+    m.alert = beeped.set
     s = Session(m, m.db.create_ticket("x"))
     threading.Timer(0.05, lambda: s.answer(s.pending["id"], "да")).start()
-    assert s.ask("question", "Какой принтер?") == "да" and beeps == [1]
+    assert s.ask("question", "Какой принтер?") == "да" and beeped.wait(2)
+
+
+def test_hanging_beep_does_not_delay_the_answer(tmp_path):
+    # Без звуковой карты MessageBeep может висеть секундами — ответ всё равно принимается сразу.
+    m = manager(tmp_path)
+    release = threading.Event()
+    m.alert = lambda: release.wait(10)
+    s = Session(m, m.db.create_ticket("x"))
+    threading.Timer(0.05, lambda: s.answer(s.pending["id"], "да")).start()
+    start = time.monotonic()
+    assert s.ask("question", "Какой принтер?") == "да"
+    assert time.monotonic() - start < 2
+    release.set()
 
     def broken():
         raise RuntimeError("нет звуковой карты")

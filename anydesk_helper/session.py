@@ -59,10 +59,9 @@ class Session:
         self.pending = {"id": pid, "kind": kind, "text": text, "data": data}
         self.event("ask", text, ask_kind=kind, ask_id=pid, **data)
         self.status("waiting")
-        try:
-            self.m.alert()  # звук слышен, даже если вкладка браузера закрыта
-        except Exception:
-            pass
+        # Звук слышен, даже если вкладка браузера закрыта. В отдельном потоке: MessageBeep без
+        # звуковой карты (RDP, сервер) может надолго зависнуть, а ответ техника ждать не должен.
+        threading.Thread(target=_safe_call, args=(self.m.alert,), name="alert", daemon=True).start()
         try:
             while True:
                 if self.stopping:
@@ -214,6 +213,13 @@ def default_factory(session: Session) -> dict:
     llm.should_stop = lambda: session.stopping  # «Стоп» прерывает повторы запроса и паузы между ними
     llm.notify = lambda text: session.event("warning", text)  # смена на запасную модель, рост max_tokens
     return {"llm": llm, "target": target, "controller": controller, "bridge": bridge}
+
+
+def _safe_call(fn) -> None:
+    try:
+        fn()
+    except Exception:
+        pass  # сигнал не должен ронять сеанс
 
 
 def beep() -> None:
