@@ -5,6 +5,7 @@ import pytest
 from anydesk_helper.bridge import ConsoleBridge
 from anydesk_helper.config import SettingsStore
 from anydesk_helper.db import DB
+from anydesk_helper.knowledge import KnowledgeBase
 from anydesk_helper.session import SessionManager
 from anydesk_helper.web import create_app
 
@@ -21,6 +22,9 @@ def env(tmp_path):
         {"observation": "", "plan_step": 1, "thought": "перезапускаю", "action": "run",
          "command": "Restart-Service spooler -Force", "risky": True},
         {"observation": "ок", "plan_step": 1, "thought": "", "action": "done", "summary": "Печать работает"},
+        {"lessons": [{"kind": "solution", "title": "Зависла очередь печати — перезапуск spooler",
+                      "problem": "документы висят в очереди", "solution": "Restart-Service spooler -Force",
+                      "tags": ["printer", "принтер"]}]},
     ]
 
     def factory(session):
@@ -33,8 +37,9 @@ def env(tmp_path):
     store = SettingsStore(tmp_path / "settings.json")
     store.update({"api_key": "sk-test-1234567890"})
     db = DB(tmp_path / "t.db")
-    manager = SessionManager(db, store, tmp_path, factory=factory)
-    app = create_app(db, store, manager, PORT, token="secret")
+    kb = KnowledgeBase(db)
+    manager = SessionManager(db, store, tmp_path, factory=factory, kb=kb)
+    app = create_app(db, store, manager, PORT, token="secret", kb=kb)
     client = app.test_client()
 
     def call(method, path, **kw):
@@ -105,6 +110,11 @@ def test_full_ticket_flow(env):
         assert k in kinds
     report = call("GET", f"/api/tickets/{tid}/export").get_data(as_text=True)
     assert "Service restarted" in report and "Не печатает принтер" in report
+    # самообучение: после решённого тикета в базе опыта появился урок
+    lessons = call("GET", "/api/knowledge?q=принтер очередь").get_json()
+    assert lessons[0]["title"].startswith("Зависла очередь") and lessons[0]["source_ticket"] == tid
+    assert "learned" in kinds
+    assert call("GET", "/api/state").get_json()["knowledge"]["lessons"] == 1
 
 
 def test_stop_session(env):
@@ -124,3 +134,18 @@ def test_start_needs_anydesk_id(env):
     tid = call("POST", "/api/tickets", json={"title": "без ID"}).get_json()["id"]
     r = call("POST", f"/api/tickets/{tid}/start", json={})
     assert r.status_code == 400 and "AnyDesk" in r.get_json()["error"]
+
+
+def test_knowledge_crud(env):
+    call, _, _ = env
+    r = call("POST", "/api/knowledge", json={"title": "Сначала проверяй кабель", "problem": "нет сети",
+                                             "solution": "Test-NetConnection", "tags": "сеть, net"})
+    lid = r.get_json()["id"]
+    assert r.status_code == 201 and r.get_json()["kind"] == "manual"
+    r = call("PATCH", f"/api/knowledge/{lid}", json={"enabled": False, "solution": "ipconfig /all"})
+    assert r.get_json()["enabled"] is False and r.get_json()["solution"] == "ipconfig /all"
+    exported = call("GET", "/api/knowledge/export").get_json()
+    assert exported[0]["title"] == "Сначала проверяй кабель"
+    assert call("POST", "/api/knowledge/import", json={"x": 1}).status_code == 400
+    assert call("DELETE", f"/api/knowledge/{lid}").status_code == 200
+    assert call("GET", "/api/knowledge").get_json() == []

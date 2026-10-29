@@ -23,7 +23,8 @@ from .version import __version__
 ANSWERS = {"yes": YES, "no": NO, "stop": STOP}
 
 
-def create_app(db, store, manager, port: int, dev: bool = False, token: str | None = None) -> Flask:
+def create_app(db, store, manager, port: int, dev: bool = False, token: str | None = None,
+               kb=None) -> Flask:
     app = Flask(__name__, static_folder=None)
     app.json.ensure_ascii = False
     token = token or secrets.token_urlsafe(24)
@@ -205,14 +206,61 @@ def create_app(db, store, manager, port: int, dev: bool = False, token: str | No
         ok, report = check_model(LLM(store.load()), store.load())
         return jsonify(ok=ok, report=report)
 
+    # ------------------------------------------------------------ база опыта
+
+    def need_kb():
+        if kb is None:
+            abort(404)
+        return kb
+
+    @app.get("/api/knowledge")
+    def knowledge():
+        return jsonify(need_kb().list(request.args.get("q", ""), request.args.get("kind", "")))
+
+    @app.post("/api/knowledge")
+    def knowledge_add():
+        b = body()
+        lesson = need_kb().add(str(b.get("kind", "manual")), str(b.get("title", "")),
+                               str(b.get("problem", "")), str(b.get("solution", "")), b.get("tags", ""))
+        return jsonify(lesson), 201
+
+    @app.patch("/api/knowledge/<int:lid>")
+    def knowledge_edit(lid):
+        if not need_kb().get(lid):
+            abort(404)
+        return jsonify(kb.update(lid, **body()))
+
+    @app.delete("/api/knowledge/<int:lid>")
+    def knowledge_delete(lid):
+        need_kb().delete(lid)
+        return jsonify(ok=True)
+
+    @app.get("/api/knowledge/export")
+    def knowledge_export():
+        return Response(need_kb().export(), mimetype="application/json", headers={
+            "Content-Disposition": 'attachment; filename="anydesk-helper-knowledge.json"'})
+
+    @app.post("/api/knowledge/import")
+    def knowledge_import():
+        items = request.get_json(silent=True)
+        if not isinstance(items, list):
+            raise ValueError("Ожидается JSON-массив уроков (файл экспорта базы опыта)")
+        return jsonify(added=need_kb().import_(items))
+
     # ------------------------------------------------------------ состояние и обновления
 
     @app.get("/api/state")
     def state():
         cur = manager.current if manager.current and manager.current.alive else None
+        s = store.load()
+        counts = db.status_counts()
         return jsonify(version=__version__, active_ticket=cur.tid if cur else None,
+                       active_status=db.get_ticket(cur.tid)["status"] if cur else None,
                        update=update_state["info"], update_error=update_state["error"],
-                       frozen=updater.can_self_update())
+                       frozen=updater.can_self_update(), counts=counts,
+                       knowledge=kb.stats() if kb else None,
+                       model={"name": s.model, "provider": s.provider, "key": bool(s.api_key),
+                              "vision": s.vision})
 
     @app.post("/api/update/check")
     def update_check():

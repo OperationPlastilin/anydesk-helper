@@ -79,12 +79,14 @@ def main(argv=None) -> int:
     from waitress import serve
 
     from .db import DB
+    from .knowledge import KnowledgeBase
     from .session import SessionManager
     from .web import create_app
 
     db = DB(data / "tickets.db")
-    manager = SessionManager(db, store, data)
-    app = create_app(db, store, manager, port, dev=args.dev)
+    kb = KnowledgeBase(db)
+    manager = SessionManager(db, store, data, kb=kb)
+    app = create_app(db, store, manager, port, dev=args.dev, kb=kb)
     print(f"Веб-интерфейс: {url}\nНе закрывайте это окно, пока работаете. Ctrl+C — выход.", flush=True)
     if not args.no_browser:
         threading.Timer(1.0, webbrowser.open, [url]).start()

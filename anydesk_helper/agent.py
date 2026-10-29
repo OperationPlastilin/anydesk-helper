@@ -16,9 +16,10 @@ from . import screen
 from .actions import (GUI_ACTIONS, Action, ActionError, extract_json, needs_confirmation,
                       parse_action)
 from .bridge import INIT, PROBE, CommandResult, enduser_dialog
+from .knowledge import KINDS, looks_like_error, prompt_block
 from .llm import LLMError, user_message
-from .prompts import (PLAN_USER, STEP_USER, load_playbooks, notes_block, plan_system,
-                      step_system)
+from .prompts import (PLAN_USER, REFLECT_SYSTEM, REFLECT_USER, STEP_USER, load_playbooks,
+                      notes_block, plan_system, step_system)
 
 YES = "yes"
 NO = "no"
@@ -37,13 +38,14 @@ class State:
     history: list[str] = field(default_factory=list)
     last: str = "(nothing yet - start with step 1 of the plan)"
     want_screenshot: bool = False
+    errors: list[str] = field(default_factory=list)  # упавшие команды — материал для уроков
     last_typed: str = ""
     recent: list[tuple] = field(default_factory=list)
 
 
 class Agent:
     def __init__(self, settings, llm, target, controller, bridge, operator, ticket: dict,
-                 playbook_dirs=(), grab=screen.grab, sleep=time.sleep):
+                 playbook_dirs=(), grab=screen.grab, sleep=time.sleep, kb=None):
         self.s = settings
         self.llm = llm
         self.target = target
@@ -56,6 +58,9 @@ class Agent:
         task = f"{ticket.get('title', '')}\n{ticket.get('description', '')}"
         self.playbook = load_playbooks(playbook_dirs, task)
         self.state = State()
+        self.kb = kb  # база опыта (knowledge.KnowledgeBase) или None
+        self.experience: list[dict] = []
+        self.experience_text = ""
 
     # ------------------------------------------------------------ общение с моделью
 
@@ -95,8 +100,22 @@ class Agent:
     def run(self) -> bool:
         self.op.event("info", "Открываю PowerShell на компьютере пользователя и собираю сведения о системе")
         self.prepare_console()
+        self.load_experience()
         self.make_plan()
         return self.loop()
+
+    def load_experience(self) -> None:
+        if not self.kb:
+            return
+        t = self.ticket
+        self.experience = self.kb.search(f"{t.get('title', '')} {t.get('description', '')}",
+                                         limit=self.s.experience_limit)
+        if not self.experience:
+            return
+        self.experience_text = prompt_block(self.experience)
+        self.kb.mark_used(t.get("id", 0), [x["id"] for x in self.experience])
+        self.op.event("experience", f"Из базы опыта взято уроков: {len(self.experience)}",
+                      lessons=[{"id": x["id"], "kind": x["kind"], "title": x["title"]} for x in self.experience])
 
     def prepare_console(self) -> None:
         self.controller.open_terminal(admin=False)
@@ -114,7 +133,7 @@ class Agent:
 
     def make_plan(self) -> None:
         st, t = self.state, self.ticket
-        system = plan_system(self.s.language, self.playbook)
+        system = plan_system(self.s.language, self.playbook, self.experience_text)
 
         def parse(data: dict) -> dict:
             plan = data.get("plan")
@@ -159,7 +178,8 @@ class Agent:
             last=st.last, step=step, max_steps=self.s.max_steps, image_note=image_note)
 
     def loop(self) -> bool:
-        system = step_system(self.s.language, self.s.vision, self.s.coords, self.playbook)
+        system = step_system(self.s.language, self.s.vision, self.s.coords, self.playbook,
+                             self.experience_text)
         first = True
         for step in range(1, self.s.max_steps + 1):
             self.state.notes += self.op.checkpoint()
@@ -234,7 +254,11 @@ class Agent:
         if a.type == "run":
             result = self.bridge.run(a.command, timeout=a.timeout)
             self.log_command(a.command, result)
-            return self.remember(step, a, result.for_model())
+            text = result.for_model()
+            if result.status == "done" and looks_like_error(result.output, result.exit_code):
+                st.errors.append(f"{a.command}\n  -> exit {result.exit_code}: {result.output.strip()[:400]}")
+                text += self.known_fix(a.command, result.output)
+            return self.remember(step, a, text)
         if a.type == "wait":
             if self.bridge.pending:
                 result = self.bridge.wait(a.seconds)
@@ -279,6 +303,57 @@ class Agent:
         st.want_screenshot = True  # после клика надо посмотреть, что получилось
         self.sleep(self.s.step_delay)
         return self.remember(step, a, result + "; new screenshot attached")
+
+    def known_fix(self, command: str, output: str) -> str:
+        """Команда упала — может, мы уже встречали такую ошибку?"""
+        if not self.kb:
+            return ""
+        used = {x["id"] for x in self.experience}
+        hits = self.kb.search(f"{command} {output[:800]}", limit=2, min_score=0.2, exclude=used)
+        if not hits:
+            return ""
+        self.experience += hits
+        self.kb.mark_used(self.ticket.get("id", 0), [h["id"] for h in hits])
+        self.op.event("experience", "Похожая ошибка уже встречалась — подсказка из базы опыта",
+                      lessons=[{"id": h["id"], "kind": h["kind"], "title": h["title"]} for h in hits])
+        return "\n\nKNOWN FROM EXPERIENCE:\n" + prompt_block(hits)
+
+    def learn(self, outcome: str) -> list[dict]:
+        """Рефлексия после сеанса: модель формулирует уроки, они попадают в базу опыта."""
+        st, t = self.state, self.ticket
+        if not self.kb or not st.history:
+            return []
+        user = REFLECT_USER.format(
+            title=t.get("title", ""), description=t.get("description", ""), outcome=outcome,
+            probe=st.probe, plan="\n".join(f"{i}. {p}" for i, p in enumerate(st.plan, 1)),
+            notes=notes_block(st.notes), history="\n".join(st.history[-40:]),
+            errors="\n".join(st.errors[-10:]) or "(none)")
+
+        def parse(data: dict) -> list[dict]:
+            lessons = data.get("lessons")
+            if not isinstance(lessons, list):
+                raise ActionError("'lessons' must be a list")
+            return [x for x in lessons if isinstance(x, dict) and x.get("title")]
+
+        try:
+            lessons = self.ask_model(REFLECT_SYSTEM.format(language=self.s.language), user, parse)
+        except (LLMError, ActionError) as e:
+            self.op.event("warning", f"Не удалось извлечь уроки из сеанса: {e}")
+            return []
+        saved = []
+        for x in lessons[:3]:
+            kind = x.get("kind") if x.get("kind") in KINDS else "solution"
+            if kind == "solution" and outcome != "solved":
+                kind = "pitfall"  # «рецепт» из нерешённого тикета — не рецепт
+            try:
+                saved.append(self.kb.add(kind, str(x.get("title", "")), str(x.get("problem", "")),
+                                         str(x.get("solution", "")), x.get("tags") or [], t.get("id")))
+            except ValueError:
+                continue
+        if saved:
+            self.op.event("learned", f"Агент запомнил уроков: {len(saved)}",
+                          lessons=[{"id": x["id"], "kind": x["kind"], "title": x["title"]} for x in saved])
+        return saved
 
     def log_command(self, command: str, result: CommandResult) -> None:
         self.op.event("command", command, command=command, output=result.output,

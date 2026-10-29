@@ -1,17 +1,37 @@
 "use strict";
 
-/* ------------------------------------------------------------------ утилиты */
+/* ================================================================== утилиты */
 
 const $ = (sel, root = document) => root.querySelector(sel);
 const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => (
   { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 const time = (ts) => (ts || "").slice(11, 16);
+const date = (ts) => (ts || "").replace("T", " ").slice(0, 16);
 
 const STATUS = {
   new: "новый", running: "в работе", waiting: "ждёт ответа", paused: "пауза",
   solved: "решён", failed: "не решён", stopped: "остановлен",
 };
+const KIND = { solution: "рецепт", error_fix: "ошибка → решение", pitfall: "не делать", manual: "от техника" };
 const pill = (status) => `<span class="pill ${esc(status)}">${esc(STATUS[status] || status)}</span>`;
+const kindPill = (k) => `<span class="pill k-${esc(k)}">${esc(KIND[k] || k)}</span>`;
+
+const ICON = {
+  pause: `<svg viewBox="0 0 16 16" width="12" height="12" fill="currentColor"><rect x="3" y="2" width="3.5" height="12" rx="1"/><rect x="9.5" y="2" width="3.5" height="12" rx="1"/></svg>`,
+  play: `<svg viewBox="0 0 16 16" width="12" height="12" fill="currentColor"><path d="M4 2.5v11a.5.5 0 0 0 .77.42l8.5-5.5a.5.5 0 0 0 0-.84l-8.5-5.5A.5.5 0 0 0 4 2.5z"/></svg>`,
+  stop: `<svg viewBox="0 0 16 16" width="11" height="11" fill="currentColor"><rect x="2.5" y="2.5" width="11" height="11" rx="1.5"/></svg>`,
+};
+const ADM_ICON = { tip: "💡", info: "ℹ️", warn: "⚠️", danger: "🔥", note: "📝" };
+function adm(type, title, body) {
+  return `<div class="adm ${type}"><div class="adm-title">${ADM_ICON[type] || ""} ${esc(title)}</div>${body}</div>`;
+}
+function codeBlock(text, { title = "", prompt = false, foot = "" } = {}) {
+  const long = String(text).split("\n").length > 14;
+  return `<div class="code">
+    <div class="bar"><span class="title">${esc(title)}</span><span class="spacer"></span>${foot}
+      ${long ? `<button data-expand>развернуть</button>` : ""}<button data-copy>копировать</button></div>
+    <pre>${prompt ? `<span class="prompt">PS&gt; </span>` : ""}${esc(text)}</pre></div>`;
+}
 
 async function api(path, { method = "GET", body } = {}) {
   const resp = await fetch(path, {
@@ -38,11 +58,16 @@ async function guarded(fn) {
   try { return await fn(); } catch (e) { toast(e.message, true); }
 }
 
-/* ------------------------------------------------------------------ состояние */
+function storeGet(key, def) { try { return localStorage.getItem(key) ?? def; } catch { return def; } }
+function storeSet(key, val) { try { localStorage.setItem(key, val); } catch { /* приватный режим */ } }
+
+/* ================================================================== состояние */
 
 const S = {
   tickets: [],
-  state: { active_ticket: null },
+  lessons: [],
+  state: { counts: {}, model: {}, knowledge: null },
+  route: "",
   ticketId: null,
   ticket: null,
   lastEventId: 0,
@@ -51,7 +76,67 @@ const S = {
   pendingId: null,
 };
 
-/* ------------------------------------------------------------------ список тикетов */
+/* ================================================================== навбар */
+
+async function loadState() {
+  S.state = await api("/api/state");
+  renderNavbar();
+}
+
+function renderNavbar() {
+  const st = S.state;
+  $("#version").textContent = "v" + (st.version || APP.version);
+  const c = st.counts || {};
+  const open = (c.running || 0) + (c.waiting || 0) + (c.paused || 0) + (c.new || 0);
+  $("#tab-count").textContent = open || "";
+  $("#kb-count").textContent = st.knowledge?.lessons || "";
+  document.querySelectorAll(".tabs a").forEach((a) => {
+    const tab = a.dataset.tab;
+    const active = (tab === "tickets" && ["tickets", "new", "ticket"].includes(S.route)) || tab === S.route;
+    a.classList.toggle("active", active);
+  });
+
+  // живой статус агента
+  const w = $("#agent-widget");
+  const line = $("#run-line");
+  if (st.active_ticket) {
+    const waiting = st.active_status === "waiting";
+    const paused = st.active_status === "paused";
+    w.innerHTML = `<div class="session ${waiting ? "waiting" : ""}">
+      <span class="dot ${waiting || paused ? "wait" : "busy"}"></span>
+      <a href="#/t/${st.active_ticket}">Тикет #${st.active_ticket}</a>
+      <span class="muted status-text">${esc(STATUS[st.active_status] || "в работе")}</span>
+      ${paused ? `<button class="mini" data-nav-ctl="resume" title="Продолжить">${ICON.play}</button>`
+               : `<button class="mini" data-nav-ctl="pause" title="Пауза">${ICON.pause}</button>`}
+      <button class="mini" data-nav-ctl="stop" title="Стоп">${ICON.stop}</button></div>`;
+    line.className = "run-line on" + (waiting || paused ? " wait" : "");
+  } else {
+    w.innerHTML = `<span class="idle"><span class="dot"></span>Агент свободен</span>`;
+    line.className = "run-line";
+  }
+  w.querySelectorAll("[data-nav-ctl]").forEach((b) =>
+    b.addEventListener("click", () => control(b.dataset.navCtl, st.active_ticket)));
+
+  // модель
+  const m = st.model || {};
+  const name = (m.name || "модель не выбрана").split("/").pop();
+  $("#model-chip").innerHTML = `<span class="dot ${m.key ? "ok" : "bad"}"></span>🧠 ${esc(name)}${m.key ? "" : " · нет ключа"}`;
+  $("#model-chip").title = m.key ? `Модель: ${m.name}` : "Не задан API-ключ — откройте настройки";
+
+  const up = $("#update-chip");
+  if (st.update) { up.textContent = `⬆ v${st.update.version}`; up.classList.remove("hidden"); }
+  else up.classList.add("hidden");
+  $("#theme-btn").textContent = document.documentElement.dataset.theme === "light" ? "🌙" : "☀️";
+}
+
+$("#theme-btn").addEventListener("click", () => {
+  const next = document.documentElement.dataset.theme === "light" ? "dark" : "light";
+  document.documentElement.dataset.theme = next;
+  storeSet("theme", next);
+  renderNavbar();
+});
+
+/* ================================================================== список тикетов */
 
 async function loadTickets() {
   const q = encodeURIComponent($("#search").value.trim());
@@ -63,60 +148,85 @@ async function loadTickets() {
 function renderList() {
   const list = $("#ticket-list");
   if (!S.tickets.length) {
-    list.innerHTML = `<p class="muted" style="padding:8px">Тикетов пока нет</p>`;
+    list.innerHTML = `<p class="muted small" style="padding:8px">Тикетов пока нет</p>`;
     return;
   }
   list.innerHTML = S.tickets.map((t) => `
     <a class="ticket-item ${t.id === S.ticketId ? "active" : ""}" href="#/t/${t.id}">
       <div class="row"><span class="title">${esc(t.title)}</span>${pill(t.status)}</div>
-      <div class="meta">#${t.id} · ${esc(t.anydesk_id || "без AnyDesk")} · ${esc(t.updated_at.replace("T", " ").slice(0, 16))}</div>
+      <div class="meta">#${t.id} · ${esc(t.anydesk_id || "без AnyDesk")} · ${esc(date(t.updated_at))}</div>
     </a>`).join("");
 }
 
-async function loadState() {
-  S.state = await api("/api/state");
-  $("#version").textContent = "v" + S.state.version;
-  const badge = $("#update-badge");
-  if (S.state.update) {
-    badge.textContent = `Доступна v${S.state.update.version}`;
-    badge.classList.remove("hidden");
-  } else badge.classList.add("hidden");
-  const active = $("#active-session");
-  if (S.state.active_ticket) {
-    active.innerHTML = `<a href="#/t/${S.state.active_ticket}">● Идёт сеанс: тикет #${S.state.active_ticket}</a>`;
-    active.classList.remove("hidden");
-  } else active.classList.add("hidden");
-}
-
-/* ------------------------------------------------------------------ роутинг */
+/* ================================================================== роутинг */
 
 function route() {
   const hash = location.hash || "#/";
   const m = hash.match(/^#\/t\/(\d+)/);
   S.ticketId = m ? Number(m[1]) : null;
+  S.ticket = null;
+  S.route = m ? "ticket" : (hash.match(/^#\/(\w+)/)?.[1] || "home");
+  $("#layout").classList.toggle("no-sidebar", !["tickets", "new", "ticket"].includes(S.route));
   $("#main").scrollTop = 0;
+  renderNavbar();
   renderList();
   if (m) return viewTicket(S.ticketId);
-  if (hash.startsWith("#/new")) return viewNew();
-  if (hash.startsWith("#/settings")) return viewSettings();
-  return viewEmpty();
+  if (S.route === "new") return viewNew();
+  if (S.route === "tickets") return viewTickets();
+  if (S.route === "kb") return viewKnowledge();
+  if (S.route === "settings") return viewSettings();
+  return viewHome();
 }
 
-function viewEmpty() {
-  $("#main").innerHTML = `
-    <div class="empty">
-      <h2>ИИ-агент техподдержки через AnyDesk</h2>
-      <p>Создайте тикет: опишите проблему пользователя и укажите его ID AnyDesk.<br>
-      Агент подключится, задаст вопросы, составит план и решит задачу через консоль PowerShell.</p>
-      <p><a class="btn primary" href="#/new">+ Новый тикет</a></p>
-    </div>`;
+/* ================================================================== главная */
+
+function viewHome() {
+  const st = S.state;
+  const c = st.counts || {};
+  const k = st.knowledge || { lessons: 0, wins: 0 };
+  const noKey = !st.model?.key;
+  $("#main").innerHTML = `<div class="container">
+    <section class="hero">
+      <h1>AnyDesk <span class="accent">Helper</span></h1>
+      <p class="tagline">ИИ-техподдержка, которая сама подключается по AnyDesk, задаёт вопросы,
+        чинит через PowerShell и учится на своих ошибках.</p>
+      <div class="actions">
+        <a class="btn primary lg" href="#/new">+ Новый тикет</a>
+        <a class="btn lg" href="#/kb">📚 База опыта</a>
+      </div>
+    </section>
+    ${noKey ? adm("warn", "Модель не настроена", `<p>Укажите API-ключ провайдера (OpenRouter или DashScope) в
+      <a href="#/settings">настройках</a> — без него агент не сможет думать.</p>`) : ""}
+    <div class="stats" style="margin-top:20px">
+      <div class="stat"><div class="num">${c.solved || 0}</div><div class="lbl">тикетов решено</div></div>
+      <div class="stat"><div class="num">${(c.running || 0) + (c.waiting || 0) + (c.new || 0)}</div><div class="lbl">открыто сейчас</div></div>
+      <div class="stat"><div class="num">${k.lessons}</div><div class="lbl">уроков в базе опыта</div></div>
+      <div class="stat"><div class="num">${k.wins}</div><div class="lbl">раз опыт помог решить</div></div>
+    </div>
+    <h2 class="section-title">Как это работает</h2>
+    <div class="features">
+      <div class="feature"><div class="ico">🎫</div><h3>Тикет</h3><p>Опишите проблему и укажите ID AnyDesk пользователя.</p></div>
+      <div class="feature"><div class="ico">💬</div><h3>Вопросы и план</h3><p>Qwen изучает систему, спрашивает недостающее и пишет план — вы его одобряете.</p></div>
+      <div class="feature"><div class="ico">⌨️</div><h3>Консоль</h3><p>Команды идут в PowerShell пользователя, вывод возвращается точным текстом.</p></div>
+      <div class="feature"><div class="ico">🧠</div><h3>Опыт</h3><p>После каждого тикета агент записывает уроки и в следующий раз решает быстрее.</p></div>
+    </div>
+    ${adm("tip", "Перед первым сеансом", `<p>В AnyDesk на этом ПК включите <b>Настройки → Ввод → «Передавать комбинации клавиш»</b>
+      и не отключайте синхронизацию буфера обмена — через неё идут команды и их вывод.</p>`)}
+  </div>`;
 }
 
-/* ------------------------------------------------------------------ новый тикет */
+function viewTickets() {
+  $("#main").innerHTML = `<div class="empty">
+    <h2>Выберите тикет слева</h2>
+    <p>или создайте новый — агент подключится, задаст вопросы и решит задачу.</p>
+    <p><a class="btn primary" href="#/new">+ Новый тикет</a></p></div>`;
+}
+
+/* ================================================================== новый тикет */
 
 function viewNew() {
-  $("#main").innerHTML = `
-    <h1 style="margin-bottom:16px">Новый тикет</h1>
+  $("#main").innerHTML = `<div class="narrow">
+    <div class="page-head"><div><h1>Новый тикет</h1><p>Чем подробнее описание, тем меньше вопросов задаст ИИ.</p></div></div>
     <form class="form card" id="new-form">
       <div class="form-row">
         <label class="field">Что нужно сделать
@@ -127,29 +237,27 @@ function viewNew() {
         </label>
       </div>
       <label class="field">Описание проблемы
-        <span class="hint">Чем подробнее, тем лучше: что случилось, что уже пробовали, какие пожелания у пользователя (версия, язык, лицензия…)</span>
-        <textarea name="description" rows="6" placeholder="Пользователь просит поставить Word и Excel. Лицензия Microsoft 365 для бизнеса, учётка есть. Windows 10."></textarea>
+        <span class="hint">Что случилось, что уже пробовали, пожелания пользователя (версия, язык, лицензия…)</span>
+        <textarea name="description" rows="6" placeholder="Бухгалтеру нужны Word и Excel. Лицензия Microsoft 365 для бизнеса, учётка есть. Windows 10."></textarea>
       </label>
       <div class="actions">
         <button class="btn primary" type="submit">Создать тикет</button>
-        <a class="btn ghost" href="#/">Отмена</a>
+        <a class="btn ghost" href="#/tickets">Отмена</a>
       </div>
-    </form>`;
+    </form></div>`;
   $("#new-form").addEventListener("submit", (e) => {
     e.preventDefault();
-    const f = new FormData(e.target);
     guarded(async () => {
-      const t = await api("/api/tickets", { method: "POST", body: Object.fromEntries(f) });
+      const t = await api("/api/tickets", { method: "POST", body: Object.fromEntries(new FormData(e.target)) });
       await loadTickets();
       location.hash = `#/t/${t.id}`;
     });
   });
 }
 
-/* ------------------------------------------------------------------ тикет */
+/* ================================================================== тикет */
 
 async function viewTicket(id) {
-  S.ticket = null;
   S.lastEventId = 0;
   S.prompts = {};
   S.planStep = null;
@@ -158,7 +266,7 @@ async function viewTicket(id) {
   const t = await guarded(() => api(`/api/tickets/${id}`));
   if (!t || S.ticketId !== id) return;
   S.ticket = t;
-  $("#main").innerHTML = `
+  $("#main").innerHTML = `<div class="container">
     <div class="ticket-head">
       <div class="info" id="t-info"></div>
       <div class="actions" id="t-actions"></div>
@@ -175,11 +283,11 @@ async function viewTicket(id) {
         <div class="card">
           <h3 id="hint-title">Подсказка агенту</h3>
           <textarea id="hint-text" rows="3" placeholder="Например: не удаляй старый Office, только обнови"></textarea>
-          <div class="actions" style="margin-top:8px"><button class="btn small" id="hint-send">Отправить</button></div>
+          <div class="actions" style="margin-top:8px"><button class="btn sm" id="hint-send">Отправить</button></div>
         </div>
-        <div class="card"><h3>Промт для ИИ</h3><div id="prompts" class="muted" style="font-size:13px">Появится после запуска</div></div>
+        <div class="card"><h3>Промт для ИИ</h3><div id="prompts" class="muted small">Появится после запуска</div></div>
       </div>
-    </div>`;
+    </div></div>`;
   $("#hint-send").addEventListener("click", sendHint);
   renderTicketMeta();
   await pollEvents();
@@ -191,27 +299,27 @@ function renderTicketMeta() {
   $("#t-info").innerHTML = `
     <h1>${esc(t.title)}</h1>
     <div class="meta">
-      <span>#${t.id}</span> ${pill(t.status)}
-      <span>AnyDesk: <b class="mono">${esc(t.anydesk_id || "—")}</b></span>
-      <span>создан ${esc(t.created_at.replace("T", " ").slice(0, 16))}</span>
+      <span class="mono">#${t.id}</span> ${pill(t.status)}
+      <span>AnyDesk <b class="mono">${esc(t.anydesk_id || "—")}</b></span>
+      <span>создан ${esc(date(t.created_at))}</span>
     </div>
     ${t.description ? `<p class="description">${esc(t.description)}</p>` : ""}
-    ${t.summary ? `<p class="description"><b>Итог:</b> ${esc(t.summary)}</p>` : ""}`;
+    ${t.summary ? `<div style="margin-top:10px">${adm(t.status === "solved" ? "tip" : "note", "Итог", `<p>${esc(t.summary)}</p>`)}</div>` : ""}`;
 
   const acts = [];
   if (sess.active) {
     acts.push(sess.paused
-      ? `<button class="btn" data-ctl="resume">▶ Продолжить</button>`
-      : `<button class="btn" data-ctl="pause">⏸ Пауза</button>`);
-    acts.push(`<button class="btn danger" data-ctl="stop">■ Стоп</button>`);
+      ? `<button class="btn" data-ctl="resume">${ICON.play} Продолжить</button>`
+      : `<button class="btn" data-ctl="pause">${ICON.pause} Пауза</button>`);
+    acts.push(`<button class="btn danger" data-ctl="stop">${ICON.stop} Стоп</button>`);
   } else {
     acts.push(`<button class="btn ghost" id="edit-btn">Изменить</button>`);
     acts.push(`<button class="btn ghost danger" id="delete-btn">Удалить</button>`);
   }
-  acts.push(`<a class="btn ghost" href="/api/tickets/${t.id}/export?t=${encodeURIComponent(APP.token)}">Экспорт отчёта</a>`);
+  acts.push(`<a class="btn ghost" href="/api/tickets/${t.id}/export?t=${encodeURIComponent(APP.token)}">⬇ Отчёт</a>`);
   $("#t-actions").innerHTML = acts.join("");
   $("#t-actions").querySelectorAll("[data-ctl]").forEach((b) =>
-    b.addEventListener("click", () => control(b.dataset.ctl)));
+    b.addEventListener("click", () => control(b.dataset.ctl, t.id)));
   $("#edit-btn")?.addEventListener("click", showEdit);
   $("#delete-btn")?.addEventListener("click", deleteTicket);
 
@@ -230,13 +338,14 @@ function renderStartCard() {
   if (card.dataset.key === key) return;
   card.dataset.key = key;
   if (t.session?.active) {
-    card.innerHTML = `<h3>Сеанс идёт</h3><p class="muted" style="margin:6px 0 0">Агент работает. Не трогайте мышь и клавиатуру этого ПК —
-      агент управляет окном AnyDesk. Аварийная остановка: мышь в левый верхний угол экрана.</p>`;
+    card.innerHTML = `<h3>Сеанс идёт</h3>
+      <p class="muted small" style="margin:0">Не трогайте мышь и клавиатуру этого ПК: агент управляет окном AnyDesk.
+      Аварийная остановка — мышь в левый верхний угол экрана.</p>`;
     return;
   }
   card.innerHTML = `
     <h3>${t.status === "new" ? "Запуск агента" : "Запустить заново"}</h3>
-    <div class="start-box" style="margin-top:10px">
+    <div class="form">
       ${APP.dev ? `
         <label class="field">Режим
           <select id="st-mode"><option value="anydesk">AnyDesk</option><option value="local">Этот ПК (тест)</option></select>
@@ -244,11 +353,11 @@ function renderStartCard() {
         <label class="check"><input type="checkbox" id="st-dry"> Без нажатий (dry-run)</label>` : ""}
       <label class="check"><input type="checkbox" id="st-connect" checked> Подключиться к ${esc(t.anydesk_id || "?")} автоматически</label>
       <label class="field">Пароль неконтролируемого доступа
-        <span class="hint">Необязательно. Без пароля пользователь сам примет подключение. Пароль не сохраняется.</span>
+        <span class="hint">Необязательно. Без пароля пользователь сам примет подключение. Не сохраняется.</span>
         <input type="password" id="st-password" autocomplete="off">
       </label>
       <button class="btn primary" id="st-start" ${busy ? "disabled" : ""}>▶ Запустить агента</button>
-      ${busy ? `<span class="muted">Сейчас идёт сеанс по тикету #${S.state.active_ticket}</span>` : ""}
+      ${busy ? `<span class="muted small">Сейчас идёт сеанс по тикету #${S.state.active_ticket}</span>` : ""}
     </div>`;
   $("#st-start").addEventListener("click", () => guarded(async () => {
     await api(`/api/tickets/${t.id}/start`, {
@@ -275,14 +384,14 @@ function renderPlan() {
         const cls = S.planStep === n ? "current" : (S.planStep && n < S.planStep ? "past" : "");
         return `<li class="${cls}">${esc(p)}</li>`;
       }).join("")}</ol>`
-    : `<p class="muted" style="margin:6px 0 0">ИИ составит план после запуска</p>`;
+    : `<p class="muted small" style="margin:0">ИИ составит план после запуска</p>`;
 }
 
-/* ------------------------------------------------------------------ вопрос ИИ (ожидает ответа) */
+/* ---------------------------------------------------------------- вопрос ИИ */
 
 const ASK_LABEL = {
   question: "ИИ спрашивает", plan: "Подтвердите план", confirm: "Подтвердите действие",
-  done: "Задача решена?", fail: "ИИ не справляется", error: "Ошибка", pick_window: "Нужна помощь",
+  done: "Задача решена?", fail: "ИИ не справляется", error: "Ошибка модели", pick_window: "Нужна помощь",
 };
 
 function renderPending() {
@@ -303,8 +412,8 @@ function renderPending() {
         <button class="btn danger" data-btn="stop">Стоп</button>`;
       break;
     case "confirm":
-      body = `${d.command ? `<pre>${esc(d.command)}</pre>` : `<pre>${esc(p.text)}</pre>`}
-        ${d.risky ? `<span class="pill risky">ИИ пометил как рискованное</span>` : ""}
+      body = `${d.command ? codeBlock(d.command, { title: "PowerShell", prompt: true }) : ""}
+        ${d.risky ? `<span><span class="pill risky">ИИ пометил как рискованное</span></span>` : ""}
         <input id="ans-text" placeholder="Или напишите, что сделать вместо этого">`;
       buttons = `<button class="btn green" data-btn="yes">Выполнить</button>
         <button class="btn" data-btn="no">Пропустить</button>
@@ -334,9 +443,9 @@ function renderPending() {
       buttons = `<button class="btn primary" data-send>Ответить</button>
         <button class="btn danger" data-btn="stop">Стоп</button>`;
   }
-  box.innerHTML = `
-    <div class="pending">
-      <div class="label">${esc(ASK_LABEL[p.kind] || "Вопрос")}</div>
+  const type = p.kind === "error" || p.kind === "fail" ? "danger" : p.kind === "done" ? "tip" : "warn";
+  box.innerHTML = `<div class="adm ${type} pending">
+      <div class="adm-title">${ADM_ICON[type]} ${esc(ASK_LABEL[p.kind] || "Вопрос")}</div>
       ${p.kind === "confirm" && d.command ? "" : `<div class="q">${esc(p.text)}</div>`}
       ${body}
       <div class="actions">${buttons}</div>
@@ -353,11 +462,10 @@ function renderPending() {
   if (input) {
     input.focus();
     input.addEventListener("keydown", (e) => {
-      if (e.key === "Enter" && !e.shiftKey && input.tagName === "INPUT") {
+      if (e.key === "Enter" && ((!e.shiftKey && input.tagName === "INPUT") || e.ctrlKey)) {
         e.preventDefault();
         box.querySelector("[data-send]")?.click();
       }
-      if (e.key === "Enter" && e.ctrlKey) box.querySelector("[data-send]")?.click();
     });
   }
   box.scrollIntoView({ block: "nearest" });
@@ -372,11 +480,12 @@ async function answer(askId, value, button) {
   });
 }
 
-async function control(cmd) {
+async function control(cmd, ticketId) {
   if (cmd === "stop" && !confirm("Остановить агента?")) return;
   await guarded(async () => {
-    await api(`/api/tickets/${S.ticketId}/control`, { method: "POST", body: { cmd } });
-    await refreshTicket();
+    await api(`/api/tickets/${ticketId}/control`, { method: "POST", body: { cmd } });
+    await loadState();
+    if (S.ticketId === ticketId) await refreshTicket();
   });
 }
 
@@ -426,16 +535,16 @@ async function deleteTicket() {
   await guarded(async () => {
     await api(`/api/tickets/${S.ticketId}`, { method: "DELETE" });
     await loadTickets();
-    location.hash = "#/";
+    location.hash = "#/tickets";
   });
 }
 
-/* ------------------------------------------------------------------ лента событий */
+/* ---------------------------------------------------------------- лента */
 
 async function refreshTicket() {
   if (!S.ticketId) return;
   const t = await api(`/api/tickets/${S.ticketId}`);
-  if (t.id !== S.ticketId) return;
+  if (t.id !== S.ticketId || !$("#t-info")) return;
   S.ticket = t;
   renderTicketMeta();
   await pollEvents();
@@ -446,7 +555,8 @@ async function pollEvents() {
   const events = await api(`/api/tickets/${id}/events?after=${S.lastEventId}`);
   if (id !== S.ticketId || !$("#timeline")) return;
   const tl = $("#timeline");
-  const nearBottom = $("#main").scrollHeight - $("#main").scrollTop - $("#main").clientHeight < 200;
+  const main = $("#main");
+  const nearBottom = main.scrollHeight - main.scrollTop - main.clientHeight < 200;
   for (const e of events) {
     S.lastEventId = e.id;
     if (e.kind === "prompt") { S.prompts[e.text] = e.data; renderPrompts(); continue; }
@@ -457,16 +567,21 @@ async function pollEvents() {
   }
   if (events.length) {
     renderPlan();
-    if (nearBottom) $("#main").scrollTop = $("#main").scrollHeight;
+    if (nearBottom) main.scrollTop = main.scrollHeight;
   }
 }
 
 function renderPrompts() {
   $("#prompts").innerHTML = Object.entries(S.prompts).map(([title, d]) => `
     <details style="margin-top:6px"><summary>${esc(title)}</summary>
-      <p class="muted" style="margin:6px 0 2px">Системный промт (инструкция и формат ответа):</p><pre>${esc(d.system)}</pre>
-      <p class="muted" style="margin:6px 0 2px">Сообщение с данными тикета:</p><pre>${esc(d.user)}</pre>
+      <p class="muted small" style="margin:6px 0 2px">Системный промт (инструкция и формат ответа):</p><pre>${esc(d.system)}</pre>
+      <p class="muted small" style="margin:6px 0 2px">Сообщение с данными тикета:</p><pre>${esc(d.user)}</pre>
     </details>`).join("");
+}
+
+function lessonList(lessons) {
+  return `<ul class="lesson-links">${(lessons || []).map((l) =>
+    `<li>${kindPill(l.kind)} <a href="#/kb?id=${l.id}">${esc(l.title)}</a></li>`).join("")}</ul>`;
 }
 
 function renderEvent(e) {
@@ -475,30 +590,34 @@ function renderEvent(e) {
   switch (e.kind) {
     case "status":
     case "info":
-      return `<div class="ev ev-line">${t}<span>${esc(e.text)}</span></div>`;
+      return `<div class="ev-line">${t}<span>${esc(e.text)}</span></div>`;
     case "warning":
-      return `<div class="ev ev-warning">${t} ⚠ ${esc(e.text)}</div>`;
+      return adm("warn", "Внимание", `<p>${esc(e.text)}</p>`);
     case "error":
-      return `<div class="ev ev-error">${t} ✘ ${esc(e.text)}
-        ${d.traceback ? `<details><summary>Подробности</summary><pre>${esc(d.traceback)}</pre></details>` : ""}</div>`;
+      return adm("danger", "Ошибка", `<p>${esc(e.text)}</p>
+        ${d.traceback ? `<details><summary>Подробности</summary><pre>${esc(d.traceback)}</pre></details>` : ""}`);
     case "plan":
-      return `<div class="ev ev-plan">${t} <b>План готов.</b> ${esc(e.text)}</div>`;
+      return adm("info", "План готов", `<p>${esc(e.text)}</p>`);
     case "ask":
-      return `<div class="ev ev-ask">${t} <b>❓ ${esc(ASK_LABEL[d.ask_kind] || "Вопрос")}:</b> ${esc(d.ask_kind === "confirm" && d.command ? d.command : e.text)}</div>`;
+      return `<div class="ev-line">${t}<span>❓ <b>${esc(ASK_LABEL[d.ask_kind] || "Вопрос")}:</b> ${esc(d.ask_kind === "confirm" && d.command ? d.command : e.text)}</span></div>`;
     case "answer":
-      return `<div class="ev ev-answer">${esc(e.text)} ${t}</div>`;
+      return `<div class="ev-answer">${esc(e.text)} ${t}</div>`;
     case "hint":
-      return `<div class="ev ev-hint">${t} 💡 Подсказка: ${esc(e.text)}</div>`;
+      return adm("note", "Подсказка техника", `<p>${esc(e.text)}</p>`);
     case "note":
-      return `<div class="ev ev-hint">${t} 📝 ${esc(e.text)}</div>`;
+      return adm("note", "Заметка", `<p>${esc(e.text)}</p>`);
+    case "experience":
+      return adm("info", "Опыт из базы", `<p>${esc(e.text)}</p>${lessonList(d.lessons)}`);
+    case "learned":
+      return adm("tip", "Агент научился", `<p>${esc(e.text)}</p>${lessonList(d.lessons)}`);
     case "done":
-      return `<div class="ev ev-done">✔ Решено: ${esc(e.text)}</div>`;
+      return adm("tip", "Решено", `<p>${esc(e.text)}</p>`);
     case "failed":
-      return `<div class="ev ev-failed">✘ Не решено: ${esc(e.text)}</div>`;
+      return adm("danger", "Не решено", `<p>${esc(e.text)}</p>`);
     case "step": {
       const img = d.image ? `<img src="/files/${S.ticketId}/${encodeURIComponent(d.image)}?t=${encodeURIComponent(APP.token)}" alt="скриншот" loading="lazy">` : "";
-      return `<div class="ev ev-step">
-        <div class="head"><b>Шаг ${esc(d.step)}</b>${d.plan_step ? `<span class="pill">пункт плана ${esc(d.plan_step)}</span>` : ""}
+      return `<div class="ev-step">
+        <div class="head"><b>Шаг ${esc(d.step)}</b>${d.plan_step ? `<span class="pill">пункт ${esc(d.plan_step)}</span>` : ""}
           ${d.risky ? `<span class="pill risky">риск</span>` : ""}<span class="spacer"></span>${t}</div>
         ${d.observation ? `<div class="observation">👁 ${esc(d.observation)}</div>` : ""}
         ${e.text ? `<div>${esc(e.text)}</div>` : ""}
@@ -509,82 +628,192 @@ function renderEvent(e) {
     case "command": {
       const status = d.status === "done"
         ? `<span class="${d.exit_code ? "exit-bad" : "exit-ok"}">код ${esc(d.exit_code ?? "?")}</span>`
-        : d.status === "running" ? `<span>ещё выполняется…</span>` : `<span class="exit-bad">консоль не ответила</span>`;
+        : d.status === "running" ? `<span>выполняется…</span>` : `<span class="exit-bad">консоль не ответила</span>`;
       const out = (d.output || "").trim();
-      const long = out.split("\n").length > 14;
-      return `<div class="ev term">
-        <div class="cmd"><span class="ps">PS&gt;</span><code>${esc(d.command || e.text)}</code>${t}</div>
-        ${out ? `<pre>${esc(out)}</pre>` : ""}
-        <div class="foot">${status}${long ? `<span class="spacer"></span><button data-expand>развернуть</button>` : ""}</div>
-      </div>`;
+      return codeBlock(`${d.command || e.text}${out ? "\n\n" + out : ""}`,
+        { title: `PowerShell · ${time(e.ts)}`, prompt: true, foot: status });
     }
     default:
-      return `<div class="ev ev-line">${t}<span>${esc(e.text)}</span></div>`;
+      return `<div class="ev-line">${t}<span>${esc(e.text)}</span></div>`;
   }
 }
 
-/* ------------------------------------------------------------------ настройки */
+/* ================================================================== база опыта */
+
+async function viewKnowledge() {
+  const focus = Number((location.hash.match(/id=(\d+)/) || [])[1] || 0);
+  $("#main").innerHTML = `<div class="narrow">
+    <div class="page-head">
+      <div style="flex:1"><h1>База опыта</h1>
+        <p>Уроки, которые агент вынес из прошлых тикетов. Перед каждым тикетом он ищет здесь похожий опыт,
+        а при ошибке команды — известное решение.</p></div>
+      <div class="actions">
+        <button class="btn primary" id="kb-add">+ Урок вручную</button>
+        <a class="btn" href="/api/knowledge/export?t=${encodeURIComponent(APP.token)}">⬇ Экспорт</a>
+        <label class="btn">⬆ Импорт<input type="file" id="kb-import" accept=".json" hidden></label>
+      </div>
+    </div>
+    ${adm("tip", "Как агент учится", `<p>После сеанса ИИ разбирает ход решения и записывает 0–3 урока: <b>рецепт</b> (что сработало),
+      <b>ошибка → решение</b> (какая команда упала и что помогло), <b>не делать</b> (что не сработало или вы отклонили).
+      Похожие уроки сливаются, а те, что чаще помогают, поднимаются выше. Уроки можно править, отключать и передавать коллегам через экспорт.</p>`)}
+    <div id="kb-form" class="hidden" style="margin-top:16px"></div>
+    <div class="kb-tools" style="margin-top:16px">
+      <input type="search" id="kb-q" placeholder="Поиск: ошибка, программа, симптом…">
+      <select id="kb-kind"><option value="">Все типы</option>${Object.entries(KIND).map(([k, v]) => `<option value="${k}">${v}</option>`).join("")}</select>
+    </div>
+    <div class="lessons" id="lessons"></div></div>`;
+  let timer;
+  $("#kb-q").addEventListener("input", () => { clearTimeout(timer); timer = setTimeout(loadLessons, 250); });
+  $("#kb-kind").addEventListener("change", () => loadLessons());
+  $("#kb-add").addEventListener("click", () => lessonForm(null));
+  $("#kb-import").addEventListener("change", (e) => guarded(async () => {
+    const file = e.target.files[0];
+    if (!file) return;
+    const items = JSON.parse(await file.text());
+    const r = await api("/api/knowledge/import", { method: "POST", body: items });
+    toast(`Импортировано уроков: ${r.added}`);
+    loadLessons();
+    loadState();
+  }));
+  await loadLessons(focus);
+}
+
+async function loadLessons(focus = 0) {
+  const q = encodeURIComponent($("#kb-q")?.value.trim() || "");
+  const kind = encodeURIComponent($("#kb-kind")?.value || "");
+  const lessons = await guarded(() => api(`/api/knowledge?q=${q}&kind=${kind}`));
+  if (!lessons || !$("#lessons")) return;
+  S.lessons = lessons;
+  $("#lessons").innerHTML = lessons.length ? lessons.map((l) => `
+    <article class="lesson ${l.enabled ? "" : "off"}" id="lesson-${l.id}">
+      <div class="top">${kindPill(l.kind)}<h3>${esc(l.title)}</h3>
+        <button class="btn sm ghost" data-edit="${l.id}">Изменить</button>
+        <button class="btn sm ghost" data-toggle="${l.id}">${l.enabled ? "Отключить" : "Включить"}</button>
+        <button class="btn sm ghost danger" data-del="${l.id}">Удалить</button></div>
+      ${l.problem ? `<div class="lbl">Когда</div><div class="txt">${esc(l.problem)}</div>` : ""}
+      ${l.solution ? `<div class="lbl">Что делать</div>${codeBlock(l.solution, { title: "решение" })}` : ""}
+      <div class="foot">
+        ${l.tags.map((t) => `<span class="tag">${esc(t)}</span>`).join("")}
+        <span class="spacer"></span>
+        <span>подсказан ${l.uses} · помог ${l.wins} · встречался ${l.seen}</span>
+        ${l.source_ticket ? `<a href="#/t/${l.source_ticket}">из тикета #${l.source_ticket}</a>` : ""}
+      </div>
+    </article>`).join("")
+    : `<div class="empty"><h3>Пока пусто</h3><p>Уроки появятся после первых решённых тикетов — или добавьте свой.</p></div>`;
+  $("#lessons").querySelectorAll("[data-edit]").forEach((b) =>
+    b.addEventListener("click", () => lessonForm(S.lessons.find((l) => l.id === Number(b.dataset.edit)))));
+  $("#lessons").querySelectorAll("[data-toggle]").forEach((b) => b.addEventListener("click", () => guarded(async () => {
+    const l = S.lessons.find((x) => x.id === Number(b.dataset.toggle));
+    await api(`/api/knowledge/${l.id}`, { method: "PATCH", body: { enabled: !l.enabled } });
+    loadLessons();
+  })));
+  $("#lessons").querySelectorAll("[data-del]").forEach((b) => b.addEventListener("click", () => guarded(async () => {
+    if (!confirm("Удалить урок?")) return;
+    await api(`/api/knowledge/${b.dataset.del}`, { method: "DELETE" });
+    loadLessons();
+    loadState();
+  })));
+  if (focus) $(`#lesson-${focus}`)?.scrollIntoView({ block: "center" });
+}
+
+function lessonForm(l) {
+  const box = $("#kb-form");
+  box.classList.remove("hidden");
+  box.innerHTML = `<form class="form card" id="lesson-form">
+      <h3>${l ? "Изменить урок" : "Новый урок"}</h3>
+      <div class="form-row">
+        <label class="field">Заголовок<input name="title" required value="${esc(l?.title || "")}" placeholder="winget не найден на Windows 10"></label>
+        <label class="field">Тип<select name="kind">${Object.entries(KIND).map(([k, v]) =>
+          `<option value="${k}" ${k === (l?.kind || "manual") ? "selected" : ""}>${v}</option>`).join("")}</select></label>
+      </div>
+      <label class="field">Когда применять<span class="hint">Симптомы, текст ошибки, версия Windows</span>
+        <textarea name="problem" rows="2">${esc(l?.problem || "")}</textarea></label>
+      <label class="field">Что делать<span class="hint">Рабочие команды и порядок действий</span>
+        <textarea name="solution" rows="3" class="mono">${esc(l?.solution || "")}</textarea></label>
+      <label class="field">Теги<input name="tags" value="${esc((l?.tags || []).join(", "))}" placeholder="winget, установка"></label>
+      <div class="actions"><button class="btn primary">Сохранить</button><button type="button" class="btn ghost" id="lf-cancel">Отмена</button></div>
+    </form>`;
+  box.scrollIntoView({ block: "nearest" });
+  $("#lf-cancel").addEventListener("click", () => box.classList.add("hidden"));
+  $("#lesson-form").addEventListener("submit", (e) => {
+    e.preventDefault();
+    guarded(async () => {
+      const body = Object.fromEntries(new FormData(e.target));
+      if (l) await api(`/api/knowledge/${l.id}`, { method: "PATCH", body });
+      else await api("/api/knowledge", { method: "POST", body });
+      box.classList.add("hidden");
+      toast("Урок сохранён");
+      loadLessons();
+      loadState();
+    });
+  });
+}
+
+/* ================================================================== настройки */
 
 async function viewSettings() {
   const { settings: s, presets } = await api("/api/settings");
   const preset = presets[s.provider] || {};
-  $("#main").innerHTML = `
-    <h1 style="margin-bottom:16px">Настройки</h1>
+  const sel = (v, cur) => (v === cur ? "selected" : "");
+  $("#main").innerHTML = `<div class="narrow">
+    <div class="page-head"><div><h1>Настройки</h1><p>Модель, поведение агента, AnyDesk и обновления.</p></div></div>
     <form id="settings-form" class="settings form">
       <section class="card form">
-        <h2>Модель (Qwen через облачный API)</h2>
+        <h2>🧠 Модель</h2>
         <label class="field">Провайдер
           <select name="provider">${Object.entries(presets).map(([k, p]) =>
-            `<option value="${k}" ${k === s.provider ? "selected" : ""}>${esc(p.title)}</option>`).join("")}</select>
+            `<option value="${k}" ${sel(k, s.provider)}>${esc(p.title)}</option>`).join("")}</select>
         </label>
         <label class="field">Адрес API<input name="base_url" value="${esc(s.base_url)}"></label>
         <label class="field">API-ключ
-          <span class="hint" id="key-hint">${s.api_key_set ? `Ключ задан (${esc(s.api_key_hint)}). Оставьте поле пустым, чтобы не менять.` : "Ключ не задан."}
-            ${preset.key_url ? `<a href="${esc(preset.key_url)}" target="_blank" rel="noopener">Получить ключ</a>` : ""}</span>
+          <span class="hint">${s.api_key_set ? `Ключ задан (${esc(s.api_key_hint)}). Оставьте поле пустым, чтобы не менять.` : "Ключ не задан."}
+            ${preset.key_url ? `<a href="${esc(preset.key_url)}" target="_blank" rel="noopener">Получить ключ →</a>` : ""}</span>
           <input name="api_key" type="password" autocomplete="off" placeholder="${s.api_key_set ? "••••••••" : "sk-..."}">
         </label>
         <label class="field">Модель
-          <span class="hint">Нужна модель, которая понимает картинки (Qwen-VL), если включены скриншоты. Для OpenRouter бесплатные модели оканчиваются на :free.</span>
+          <span class="hint">Для скриншотов нужна модель с картинками (Qwen-VL). На OpenRouter бесплатные модели оканчиваются на :free.</span>
           <div class="actions" style="flex-wrap:nowrap">
             <input name="model" list="models" value="${esc(s.model)}">
-            <button type="button" class="btn" id="load-models">Загрузить список</button>
+            <button type="button" class="btn" id="load-models">Список</button>
           </div>
           <datalist id="models"></datalist>
         </label>
         <div class="form-row">
-          <label class="check"><input type="checkbox" name="vision" ${s.vision ? "checked" : ""}> Скриншоты и мышь (модель видит экран)</label>
+          <label class="check"><input type="checkbox" name="vision" ${s.vision ? "checked" : ""}> Скриншоты и мышь</label>
           <label class="check"><input type="checkbox" name="json_mode" ${s.json_mode ? "checked" : ""}> Строгий JSON-режим API</label>
         </div>
         <label class="field">Формат координат
           <select name="coords">
-            <option value="pixels" ${s.coords === "pixels" ? "selected" : ""}>Пиксели (Qwen2.5-VL, qwen-vl-max)</option>
-            <option value="norm1000" ${s.coords === "norm1000" ? "selected" : ""}>0..1000 (Qwen3-VL)</option>
+            <option value="pixels" ${sel("pixels", s.coords)}>Пиксели (Qwen2.5-VL, qwen-vl-max)</option>
+            <option value="norm1000" ${sel("norm1000", s.coords)}>0..1000 (Qwen3-VL)</option>
           </select>
         </label>
-        <div class="actions">
-          <button type="button" class="btn" id="check-model">Проверить модель</button>
-          <span class="muted" style="font-size:12px">сначала сохраните изменения</span>
-        </div>
+        <div class="actions"><button type="button" class="btn" id="check-model">Проверить модель</button>
+          <span class="muted small">сначала сохраните изменения</span></div>
         <pre class="report hidden" id="check-report"></pre>
       </section>
 
       <section class="card form">
-        <h2>Агент</h2>
+        <h2>🤖 Агент</h2>
         <label class="field">Что подтверждать вручную
           <select name="confirm">
-            <option value="risky" ${s.confirm === "risky" ? "selected" : ""}>Только рискованное: установка, удаление, реестр, админ-права (рекомендуется)</option>
-            <option value="all" ${s.confirm === "all" ? "selected" : ""}>Каждое действие</option>
-            <option value="none" ${s.confirm === "none" ? "selected" : ""}>Ничего (полностью автономно)</option>
+            <option value="risky" ${sel("risky", s.confirm)}>Только рискованное: установка, удаление, реестр, админ-права</option>
+            <option value="all" ${sel("all", s.confirm)}>Каждое действие</option>
+            <option value="none" ${sel("none", s.confirm)}>Ничего (полностью автономно)</option>
           </select>
         </label>
         <div class="form-row">
           <label class="field">Язык ответов ИИ<input name="language" value="${esc(s.language)}"></label>
           <label class="field">Максимум шагов<input name="max_steps" type="number" min="5" max="500" value="${s.max_steps}"></label>
         </div>
+        <div class="form-row">
+          <label class="check"><input type="checkbox" name="learning" ${s.learning ? "checked" : ""}> Самообучение после каждого сеанса</label>
+          <label class="field">Уроков из базы в промт<input name="experience_limit" type="number" min="0" max="15" value="${s.experience_limit}"></label>
+        </div>
       </section>
 
       <section class="card form">
-        <h2>AnyDesk</h2>
+        <h2>🖥 AnyDesk</h2>
         <label class="field">Путь к AnyDesk.exe
           <span class="hint">Пусто — найти автоматически; если AnyDesk не установлен, программа скачает его с anydesk.com.</span>
           <input name="anydesk_path" value="${esc(s.anydesk_path)}" placeholder="C:\\Program Files (x86)\\AnyDesk\\AnyDesk.exe">
@@ -596,7 +825,7 @@ async function viewSettings() {
       </section>
 
       <section class="card form">
-        <h2>Программа и обновления</h2>
+        <h2>⬆ Программа и обновления</h2>
         <label class="check"><input type="checkbox" name="auto_update" ${s.auto_update ? "checked" : ""}> Проверять обновления на GitHub при запуске</label>
         <label class="field">Порт веб-интерфейса<input name="port" type="number" value="${s.port}"></label>
         <div class="actions">
@@ -604,11 +833,10 @@ async function viewSettings() {
           <button type="button" class="btn" id="upd-check">Проверить обновления</button>
           <button type="button" class="btn green hidden" id="upd-install"></button>
         </div>
-        <p class="muted hidden" id="upd-text" style="margin:0"></p>
+        <p class="muted hidden small" id="upd-text" style="margin:0"></p>
       </section>
-
-      <div class="actions"><button class="btn primary">Сохранить</button></div>
-    </form>`;
+      <div class="actions"><button class="btn primary lg">Сохранить</button></div>
+    </form></div>`;
 
   const form = $("#settings-form");
   form.provider.addEventListener("change", () => {
@@ -621,9 +849,10 @@ async function viewSettings() {
     e.preventDefault();
     guarded(async () => {
       const data = Object.fromEntries(new FormData(form));
-      for (const name of ["vision", "json_mode", "auto_update"]) data[name] = form[name].checked;
+      for (const name of ["vision", "json_mode", "auto_update", "learning"]) data[name] = form[name].checked;
       await api("/api/settings", { method: "POST", body: data });
       toast("Настройки сохранены");
+      await loadState();
       viewSettings();
     });
   });
@@ -641,8 +870,9 @@ async function viewSettings() {
     rep.textContent = r.report.join("\n");
   }));
   $("#upd-check").addEventListener("click", () => guarded(async () => {
-    const st = await api("/api/update/check", { method: "POST" });
-    showUpdate(st);
+    S.state = await api("/api/update/check", { method: "POST" });
+    renderNavbar();
+    showUpdate(S.state, true);
   }));
   $("#upd-install").addEventListener("click", () => guarded(async () => {
     const r = await api("/api/update/install", { method: "POST" });
@@ -652,7 +882,7 @@ async function viewSettings() {
   if (S.state.update) showUpdate(S.state);
 }
 
-function showUpdate(st) {
+function showUpdate(st, checked = false) {
   const text = $("#upd-text");
   const btn = $("#upd-install");
   if (!text) return;
@@ -662,7 +892,7 @@ function showUpdate(st) {
     text.textContent = `Доступна версия ${st.update.version}. ${st.update.notes || ""}`;
     if (st.frozen) { btn.textContent = `Обновить до ${st.update.version}`; btn.classList.remove("hidden"); }
     else text.textContent += " (из исходников обновляйтесь через git pull)";
-  } else text.textContent = "У вас последняя версия.";
+  } else if (checked) text.textContent = "У вас последняя версия.";
 }
 
 async function waitForRestart() {
@@ -672,7 +902,7 @@ async function waitForRestart() {
   } catch { setTimeout(waitForRestart, 2000); }
 }
 
-/* ------------------------------------------------------------------ запуск */
+/* ================================================================== запуск */
 
 document.addEventListener("click", (e) => {
   const img = e.target.closest(".ev-step img");
@@ -684,18 +914,27 @@ document.addEventListener("click", (e) => {
   }
   const exp = e.target.closest("[data-expand]");
   if (exp) {
-    const pre = exp.closest(".term").querySelector("pre");
+    const pre = exp.closest(".code").querySelector("pre");
     pre.classList.toggle("expanded");
     exp.textContent = pre.classList.contains("expanded") ? "свернуть" : "развернуть";
   }
+  const copy = e.target.closest("[data-copy]");
+  if (copy) {
+    const pre = copy.closest(".code").querySelector("pre").cloneNode(true);
+    pre.querySelector(".prompt")?.remove();
+    navigator.clipboard?.writeText(pre.textContent).then(() => {
+      copy.textContent = "скопировано ✓";
+      setTimeout(() => { copy.textContent = "копировать"; }, 1500);
+    }, () => toast("Не удалось скопировать", true));
+  }
 });
-$("#update-badge").addEventListener("click", () => { location.hash = "#/settings"; });
 let searchTimer;
 $("#search").addEventListener("input", () => { clearTimeout(searchTimer); searchTimer = setTimeout(loadTickets, 250); });
 $("#status-filter").addEventListener("change", loadTickets);
 window.addEventListener("hashchange", route);
 
 (async function init() {
+  document.documentElement.dataset.theme = storeGet("theme", "dark");
   $("#version").textContent = "v" + APP.version;
   await guarded(loadState);
   await guarded(loadTickets);

@@ -34,7 +34,7 @@ Rules:
 when you know it. First step: diagnose. Last step: verify the result.
 - Prefer PowerShell one-liners and winget. Use the mouse only where a window must be clicked.
 - Write all texts in {language}.
-{playbook}"""
+{experience}{playbook}"""
 
 PLAN_USER = """TICKET #{ticket_id}: {title}
 PROBLEM DESCRIPTION:
@@ -89,7 +89,7 @@ services, reboots, or confirms UAC.
 "thought": "Проверю, установлен ли уже Office.", "action": "run", \
 "command": "Get-Package *Office* -ErrorAction SilentlyContinue | Select-Object Name, Version", \
 "timeout": 60, "risky": false}}
-{playbook}"""
+{experience}{playbook}"""
 
 GUI_ACTIONS = """Screen (only when a window must be clicked: UAC prompt, installer, GUI-only settings):
 - screenshot    {{}}  look at the screen; you get the image in the next message
@@ -126,14 +126,53 @@ LAST RESULT:
 STEP {step} of {max_steps}.{image_note} Reply with ONE JSON object in the required format."""
 
 
-def step_system(language: str, vision: bool, coords: str, playbook: str) -> str:
+REFLECT_SYSTEM = """You review a finished IT support session and extract lessons that will help \
+to solve similar tickets faster next time. This is how the support agent learns from experience.
+
+Answer with ONE JSON object, nothing else:
+{{"lessons": [{{"kind": "solution|error_fix|pitfall", "title": "<short, searchable>", \
+"problem": "<when it applies: symptoms, error text, Windows version>", \
+"solution": "<what to do: exact working commands>", "tags": ["<keyword>", ...]}}]}}
+
+- 0-3 lessons, only reusable knowledge. [] if the session taught nothing new.
+- solution: the working recipe for this kind of task (only if the ticket was solved).
+- error_fix: a command failed with error X, and Y fixed it (quote the key error text).
+- pitfall: an approach that did not work or was rejected by the technician - avoid next time.
+- Technician's hints and corrections are the most valuable: keep them.
+- NO personal data: no names, e-mails, passwords, license keys, PC names.
+- Write title, problem, solution in {language}; tags in English and {language}."""
+
+REFLECT_USER = """TICKET: {title}
+PROBLEM: {description}
+OUTCOME: {outcome}
+CUSTOMER PC: {probe}
+
+PLAN:
+{plan}
+{notes}
+STEPS (command -> result):
+{history}
+
+FAILED COMMANDS:
+{errors}"""
+
+
+def step_system(language: str, vision: bool, coords: str, playbook: str, experience: str = "") -> str:
     gui = GUI_ACTIONS.format(coords_help=COORDS_HELP[coords]) if vision else ""
-    return STEP_SYSTEM.format(gui_actions=gui, screen_rule=SCREEN_RULE[vision],
-                              language=language, playbook=playbook_block(playbook))
+    return STEP_SYSTEM.format(gui_actions=gui, screen_rule=SCREEN_RULE[vision], language=language,
+                              playbook=playbook_block(playbook), experience=experience_block(experience))
 
 
-def plan_system(language: str, playbook: str) -> str:
-    return PLAN_SYSTEM.format(language=language, playbook=playbook_block(playbook))
+def plan_system(language: str, playbook: str, experience: str = "") -> str:
+    return PLAN_SYSTEM.format(language=language, playbook=playbook_block(playbook),
+                              experience=experience_block(experience))
+
+
+def experience_block(text: str) -> str:
+    if not text:
+        return ""
+    return ("\n=== EXPERIENCE FROM PREVIOUS TICKETS (it worked before - prefer it; avoid pitfalls) ===\n"
+            f"{text}\n")
 
 
 def playbook_block(text: str) -> str:

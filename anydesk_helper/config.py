@@ -61,6 +61,8 @@ class Settings:
     step_delay: float = 1.0
     screenshot_max_side: int = 1288
     command_timeout: int = 120
+    learning: bool = True  # после сеанса извлекать уроки в базу опыта
+    experience_limit: int = 5  # сколько уроков из базы класть в промт
     # --- AnyDesk ---
     anydesk_path: str = ""
     connect_timeout: int = 90

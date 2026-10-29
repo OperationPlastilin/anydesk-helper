@@ -131,12 +131,13 @@ class Session:
     def _run(self) -> None:
         self.status("running")
         self.event("status", "Сеанс начат")
-        result_status, summary = "failed", ""
+        result_status, summary, agent = "failed", "", None
+        settings = self.m.settings()
         try:
             parts = self.m.factory(self)
-            agent = Agent(self.m.settings(), parts["llm"], parts["target"], parts["controller"],
+            agent = Agent(settings, parts["llm"], parts["target"], parts["controller"],
                           parts["bridge"], self, self.ticket, playbook_dirs=self.m.playbook_dirs,
-                          grab=parts.get("grab") or _default_grab(), sleep=self.sleep)
+                          grab=parts.get("grab") or _default_grab(), sleep=self.sleep, kb=self.m.kb)
             ok = agent.run()
             result_status = "solved" if ok else "failed"
         except StopSession:
@@ -145,6 +146,15 @@ class Session:
         except Exception as e:  # сеанс не должен ронять программу
             self.event("error", f"Ошибка: {e}", traceback=traceback.format_exc())
         finally:
+            if self.m.kb:
+                self.m.kb.mark_outcome(self.tid, result_status == "solved")
+            # Самообучение: разбираем сеанс и запоминаем уроки (кроме остановленных вручную).
+            if agent and settings.learning and result_status in ("solved", "failed"):
+                try:
+                    self.event("info", "Агент разбирает сеанс и записывает уроки в базу опыта…")
+                    agent.learn(result_status)
+                except Exception as e:
+                    self.event("warning", f"Самообучение не удалось: {e}")
             for e in reversed(self.m.db.events(self.tid)):
                 if e["kind"] in ("done", "failed"):
                     summary = e["text"]
@@ -212,8 +222,9 @@ def find_target(session: Session, s):
 class SessionManager:
     """Один активный сеанс за раз: мышь и клавиатура у компьютера одни."""
 
-    def __init__(self, db, settings_store, data_dir: Path, factory=default_factory):
+    def __init__(self, db, settings_store, data_dir: Path, factory=default_factory, kb=None):
         self.db = db
+        self.kb = kb
         self.store = settings_store
         self.data_dir = Path(data_dir)
         self.files_dir = self.data_dir / "files"

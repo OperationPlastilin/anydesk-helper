@@ -86,6 +86,11 @@ class DB:
             rows = self.conn.execute(sql, args).fetchall()
         return [self._ticket(r) for r in rows]
 
+    def status_counts(self) -> dict:
+        with self.lock:
+            rows = self.conn.execute("SELECT status, COUNT(*) FROM tickets GROUP BY status").fetchall()
+        return {status: n for status, n in rows}
+
     def update_ticket(self, ticket_id: int, **fields) -> dict | None:
         sets, args = [], []
         for key, value in fields.items():
