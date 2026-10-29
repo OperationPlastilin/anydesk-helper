@@ -98,4 +98,7 @@ AnyDeskHelper.exe (launcher.py -> anydesk_helper/__main__.py)
 - Релиз: smoke-тест в release.yml берёт токен из `%LOCALAPPDATA%\AnyDeskHelper\token` (без него «/» = 401).
 - Самообновление onefile: перезапуск с PYINSTALLER_RESET_ENVIRONMENT=1 (нужен PyInstaller ≥ 6.9), .bat через
   CREATE_NO_WINDOW (скрытая консоль, а не DETACHED_PROCESS).
+- Тесты с Session.ask: отвечать, когда `pending` опубликован (`answer_when_asked`), а не по таймеру — на Windows
+  запись в SQLite медленнее; в ask сначала статус и событие, потом pending; звук — в отдельном потоке.
+- Проверка сборки без релиза: запустить release.yml вручную (workflow_dispatch) — публикуется только артефакт.
 - В `ps … | grep` не пиши паттерн, совпадающий с собственной командной строкой (`kill` убьёт свою же оболочку).
