@@ -1,11 +1,19 @@
 name: Release
 
-# Новая версия: git tag v0.3.0 && git push origin v0.3.0
+# Новая версия — любой из способов:
+#   1) git tag v0.3.1 && git push origin v0.3.1
+#   2) GitHub -> Actions -> Release -> Run workflow, поле «version»: 0.3.1 (тег создастся сам)
 # Сборка создаст релиз с AnyDeskHelper.exe — установленные программы обновятся при перезапуске.
+# Run workflow с пустой версией — только проверочная сборка, без публикации.
 on:
   push:
     tags: ["v*"]
   workflow_dispatch:
+    inputs:
+      version:
+        description: "Версия релиза, например 0.3.1 (пусто — только проверочная сборка)"
+        required: false
+        default: ""
 
 permissions:
   contents: write
@@ -20,11 +28,14 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Set version from tag
-        if: github.ref_type == 'tag'
+      - name: Set version
+        if: github.ref_type == 'tag' || inputs.version != ''
         shell: pwsh
+        env:
+          TAG: ${{ github.ref_type == 'tag' && github.ref_name || inputs.version }}
         run: |
-          $v = "${{ github.ref_name }}".TrimStart("v")
+          $v = $env:TAG.Trim().TrimStart("v")
+          if ($v -notmatch '^\d+\.\d+\.\d+$') { throw "Версия должна быть вида 1.2.3, а не '$v'" }
           $file = "anydesk_helper/version.py"
           (Get-Content $file -Raw) -replace '__version__ = "[^"]*"', "__version__ = `"$v`"" | Set-Content $file -NoNewline
           Get-Content $file
@@ -66,9 +77,12 @@ jobs:
           path: dist/AnyDeskHelper.exe*
 
       - name: Publish release
-        if: github.ref_type == 'tag'
+        if: github.ref_type == 'tag' || inputs.version != ''
         uses: softprops/action-gh-release@v2
         with:
+          # При ручном запуске тега ещё нет — action создаст его на собранном коммите.
+          tag_name: ${{ github.ref_type == 'tag' && github.ref_name || format('v{0}', inputs.version) }}
+          target_commitish: ${{ github.sha }}
           files: |
             dist/AnyDeskHelper.exe
             dist/AnyDeskHelper.exe.sha256
