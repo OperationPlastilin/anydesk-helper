@@ -22,6 +22,7 @@ python -m anydesk_helper --dev           # из исходников; --dev = р
 python -m anydesk_helper --check         # проверка модели из настроек
 ./build.ps1                              # Windows: PyInstaller -> dist/AnyDeskHelper.exe + .sha256
 git tag vX.Y.Z && git push origin vX.Y.Z # релиз: Actions собирает exe -> GitHub Release -> автообновление
+# из облачной сессии теги не пушатся (403): Actions -> Release -> Run workflow с полем version=X.Y.Z
 ```
 
 ## Mind map
