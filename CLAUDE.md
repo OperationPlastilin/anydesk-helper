@@ -17,7 +17,7 @@ AnyDesk Helper: Windows-программа техника. Локальный в
 
 ## Команды
 ```bash
-python -m pytest -q                      # ~300 тестов; PowerShell-тесты идут только на Windows (CI)
+python -m pytest -q                      # ~320 тестов; PowerShell-тесты идут только на Windows (CI)
 python -m anydesk_helper --dev           # из исходников; --dev = режим «этот ПК» + dry-run в UI
 python -m anydesk_helper --check         # проверка модели из настроек
 ./build.ps1                              # Windows: PyInstaller -> dist/AnyDeskHelper.exe + .sha256
@@ -41,7 +41,8 @@ AnyDeskHelper.exe (launcher.py -> anydesk_helper/__main__.py)
 │  ├─ Session = «оператор» для агента; resume=True -> restore_state(events) -> Agent.run(saved)
 │  └─ default_factory: окно AnyDesk + Controller(target) + ConsoleBridge(local_name=COMPUTERNAME техника)
 │     + LLM(should_stop, notify); после Стопа/аварийной остановки рефлексии нет
-├─ agent.py: Agent.run(resume) = prepare_console(проба) -> load_experience -> make_plan | resume -> loop
+├─ agent.py: Agent.run(resume) = prepare_console(проба; no_ack -> скриншот в ленту + ask("error"): техник
+│  открывает PowerShell сам -> «Повторить» / «Продолжить без консоли», до 3 попыток) -> load_experience -> make_plan | resume -> loop
 │  ├─ StopSession во время команды -> cancel_command() = Ctrl+C в консоли пользователя
 │  ├─ remote(): FocusError -> ask("error") повторить/стоп; FailSafe -> StopSession; status refused -> StopSession
 │  ├─ после ответа модели снова checkpoint() (Стоп во время запроса не выполняет действие); wait дробится
@@ -56,7 +57,9 @@ AnyDeskHelper.exe (launcher.py -> anydesk_helper/__main__.py)
 │  параметры Qwen), needs_confirmation (DANGEROUS_PATTERNS + is_remote_code: iex, -enc, скачать-и-запустить)
 ├─ knowledge.py: таблицы lessons + lesson_uses; tokens() (стем: первые 6 букв), search, scrub
 ├─ db.py: SQLite tickets + events (data JSON); при старте running/waiting -> stopped
-├─ llm.py: chat() (json_mode с откатом, ретраи 429/5xx c Retry-After, дневной лимит -> fallback_model,
+├─ llm.py: chat() (model="auto" -> pick_model(): бесплатная Qwen с картинками из /models; модель пропала
+│  (404 «unavailable for free» и т.п.) -> fallback_model или pick_model, on_model_change сохраняет в настройки;
+│  POST в потоке — «Стоп» прерывает сразу; json_mode с откатом, ретраи 429/5xx c Retry-After, дневной лимит -> fallback_model,
 │  пустой/обрезанный ответ -> поднять max_tokens), finish_reason, list_models()
 ├─ controller.py (pyautogui, ленивый импорт; focus() перед КАЖДЫМ вводом; латиница по VK-кодам — не зависит от
 │  раскладки; Esc перед повтором недопечатанной строки), anydesk.py (WindowTarget.focus проверяет

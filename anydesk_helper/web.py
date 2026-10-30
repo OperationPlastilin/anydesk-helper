@@ -238,8 +238,13 @@ def create_app(db, store, manager, port: int, dev: bool = False, token: str | No
     def check():
         from .checks import check_model
 
-        ok, report = check_model(LLM(store.load()), store.load())
-        return jsonify(ok=ok, report=report)
+        settings = store.load()
+        llm = LLM(settings)
+        notes: list[str] = []
+        llm.notify = notes.append  # автовыбор/замена модели — показываем в отчёте проверки
+        llm.on_model_change = lambda model: store.update({"model": model})
+        ok, report = check_model(llm, settings)
+        return jsonify(ok=ok, report=report[:1] + [f"ℹ {n}" for n in notes] + report[1:])
 
     # ------------------------------------------------------------ база опыта
 

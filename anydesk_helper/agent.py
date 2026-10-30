@@ -31,6 +31,18 @@ ADMIN_CHECK = ("([Security.Principal.WindowsPrincipal][Security.Principal.Window
                ".IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)")
 
 
+CONSOLE_ATTEMPTS = 3  # проба консоли: первая попытка + две после ручного открытия PowerShell техником
+
+NO_ACK_HELP = (
+    "Консоль пользователя не ответила на команду. Посмотрите скриншот ниже и проверьте:\n"
+    "1) открылось ли PowerShell (нет — в AnyDesk на ЭТОМ ПК: Настройки → Ввод → «Передавать комбинации "
+    "клавиш», иначе Win+R открывает «Выполнить» у вас);\n"
+    "2) есть ли в окне PowerShell вставленная строка (нет — включите синхронизацию буфера обмена: "
+    "Настройки → Безопасность/Разрешения → «Буфер обмена» на обеих сторонах);\n"
+    "3) строка есть, но не выполнилась — пусть пользователь не трогает клавиатуру и окно консоли.\n"
+    "Можно открыть PowerShell у пользователя вручную и нажать «Повторить» в вопросе ниже.")
+
+
 class StopSession(Exception):
     pass
 
@@ -215,17 +227,36 @@ class Agent:
 
     def prepare_console(self) -> None:
         self.remote(self.controller.open_terminal, admin=False, esc_before_retry=True)
-        result = self.console(f"{INIT}; {PROBE}", 40)
-        self.op.event("command", "Сведения о системе", command="(проба системы)",
-                      output=result.output, status=result.status, exit_code=result.exit_code)
-        if result.status == "done":
-            self.state.probe = result.output.strip()
-            self.state.last = "Console is open (not admin unless the probe says admin: True)."
-        else:
-            self.op.event("warning", "Консоль не ответила. Проверьте в AnyDesk: «Передавать "
-                          "комбинации клавиш» и синхронизацию буфера обмена.")
-            self.state.last = result.for_model()
-            self.state.want_screenshot = self.s.vision
+        for attempt in range(1, CONSOLE_ATTEMPTS + 1):
+            result = self.console(f"{INIT}; {PROBE}", 40)
+            self.op.event("command", "Сведения о системе", command="(проба системы)",
+                          output=result.output, status=result.status, exit_code=result.exit_code)
+            if result.status == "done":
+                self.state.probe = result.output.strip()
+                self.state.last = "Console is open (not admin unless the probe says admin: True)."
+                return
+            # Скриншот — технику для диагностики (без запроса к модели): видно, открылось ли «Выполнить»,
+            # PowerShell, есть ли в нём вставленная строка.
+            self.op.event("warning", NO_ACK_HELP, image=self.diagnostic_shot())
+            if attempt == CONSOLE_ATTEMPTS:
+                break
+            # Без консоли агент работает вслепую — даём технику открыть PowerShell у пользователя
+            # руками (так работает, даже если AnyDesk не передаёт Win+R) и повторить пробу.
+            answer = self.op.ask("error", "Консоль пользователя не ответила (скриншот выше). Откройте у "
+                                 "пользователя PowerShell вручную (Win+R → powershell → Enter), щёлкните в "
+                                 "его окно и нажмите «Повторить». «Стоп» — завершить сеанс.",
+                                 skip_label="Продолжить без консоли")
+            self.check_stop(answer)
+            if answer == NO:
+                break  # продолжаем без консоли: модель попробует разобраться по скриншоту
+        self.state.last = result.for_model()
+        self.state.want_screenshot = self.s.vision
+
+    def diagnostic_shot(self) -> str | None:
+        try:
+            return self.op.image(0, self.capture().image)
+        except Exception:  # скриншот — подсказка, сеанс из-за него не падает
+            return None
 
     def make_plan(self) -> None:
         st, t = self.state, self.ticket

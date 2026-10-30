@@ -214,6 +214,7 @@ def default_factory(session: Session) -> dict:
     llm = LLM(s)
     llm.should_stop = lambda: session.stopping  # «Стоп» прерывает повторы запроса и паузы между ними
     llm.notify = lambda text: session.event("warning", text)  # смена на запасную модель, рост max_tokens
+    llm.on_model_change = lambda model: session.m.store.update({"model": model})  # автовыбор сохраняем
     return {"llm": llm, "target": target, "controller": controller, "bridge": bridge}
 
 

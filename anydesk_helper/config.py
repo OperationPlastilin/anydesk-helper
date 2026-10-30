@@ -15,7 +15,9 @@ PRESETS = {
     "openrouter": {
         "title": "OpenRouter (бесплатные модели :free)",
         "base_url": "https://openrouter.ai/api/v1",
-        "model": "qwen/qwen2.5-vl-72b-instruct:free",
+        # auto — программа сама выберет лучшую бесплатную Qwen-VL: бесплатные модели OpenRouter часто
+        # меняются (так исчезла qwen/qwen2.5-vl-72b-instruct:free), а жёстко прописанная ломает запуск.
+        "model": "auto",
         "coords": "pixels",
         "key_url": "https://openrouter.ai/keys",
     },

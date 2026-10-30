@@ -535,6 +535,7 @@ function renderPending() {
       break;
     case "error":
       buttons = `<button class="btn" data-btn="yes">Повторить</button>
+        ${d.skip_label ? `<button class="btn" data-btn="no">${esc(d.skip_label)}</button>` : ""}
         <button class="btn danger" data-btn="stop">Стоп</button>`;
       break;
     case "pick_window":
@@ -718,6 +719,11 @@ const CMD_FOOT = {
 };
 const CMD_WAIT = new Set(["running", "busy"]); // не ошибка: результат будет или команду повторят
 
+function shot(name) {
+  // Скриншот к событию (диагностика «консоль не ответила» и т.п.), открывается по клику крупно.
+  return name ? `<div class="ev-step" style="border:0;padding:0;background:none"><img src="/files/${S.ticketId}/${encodeURIComponent(name)}?t=${encodeURIComponent(APP.token)}" alt="скриншот" loading="lazy"></div>` : "";
+}
+
 function renderEvent(e) {
   const d = e.data || {};
   const t = `<span class="time">${time(e.ts)}</span>`;
@@ -726,7 +732,7 @@ function renderEvent(e) {
     case "info":
       return `<div class="ev-line">${t}<span>${esc(e.text)}</span></div>`;
     case "warning":
-      return adm("warn", "Внимание", `<p>${esc(e.text)}</p>`);
+      return adm("warn", "Внимание", `<p style="white-space:pre-line">${esc(e.text)}</p>${shot(d.image)}`);
     case "error":
       return adm("danger", "Ошибка", `<p>${esc(e.text)}</p>
         ${d.traceback ? `<details><summary>Подробности</summary><pre>${esc(d.traceback)}</pre></details>` : ""}`);
@@ -904,7 +910,7 @@ async function viewSettings() {
           <input name="api_key" type="password" autocomplete="off" placeholder="${s.api_key_set ? "••••••••" : "sk-..."}">
         </label>
         <label class="field">Модель
-          <span class="hint">Для скриншотов нужна модель с картинками (Qwen-VL). На OpenRouter бесплатные модели оканчиваются на :free.</span>
+          <span class="hint"><b>auto</b> — программа сама выберет лучшую бесплатную Qwen с картинками и заменит её, если модель пропадёт. Для скриншотов нужна модель с картинками (Qwen-VL); бесплатные на OpenRouter оканчиваются на :free.</span>
           <div class="actions" style="flex-wrap:nowrap">
             <input name="model" list="models" value="${esc(s.model)}">
             <button type="button" class="btn" id="load-models">Список</button>
