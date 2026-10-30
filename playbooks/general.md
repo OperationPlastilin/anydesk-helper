@@ -1,9 +1,12 @@
 keywords: *
-- Права администратора: проверь `([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole('Administrators')`. Если False, а нужна установка или правка системы — open_terminal с admin=true и подтверди UAC.
+- Права администратора: `([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)` (не по имени группы: на русской Windows 'Administrators' всегда даёт False). `admin:` из пробы относится только к первой консоли — после open_terminal admin=true проверь этой командой. Если False, а нужна установка или правка системы — open_terminal с admin=true и подтверди UAC.
+- Если UAC спросил логин и пароль, консоль администратора работает под ДРУГОЙ учёткой: $env:APPDATA, $env:TEMP, HKCU: и Cert:\CurrentUser в ней чужие — файлы и настройки пользователя меняй в его обычной консоли.
+- Группы — по SID, имена локализованы ('Administrators', 'Users', 'Everyone' на русской Windows не находятся): S-1-5-32-544 Администраторы, S-1-5-32-545 Пользователи, S-1-5-32-555 Пользователи удалённого рабочего стола, S-1-1-0 Все. `Get-LocalGroupMember -SID S-1-5-32-544`, `Add-LocalGroupMember -SID S-1-5-32-544 -Member <user>`, icacls: `'*S-1-5-32-545:(OI)(CI)M'` (в кавычках). Русское имя (для net localgroup, New-SmbShare): `([Security.Principal.SecurityIdentifier]'S-1-5-32-544').Translate([Security.Principal.NTAccount]).Value.Split('\')[-1]`.
 - Установка программ: `winget install --id <Id> -e --silent --accept-package-agreements --accept-source-agreements`. Найти Id: `winget search <название> | Select-Object -First 15`.
 - Если winget нет: `Add-AppxPackage -RegisterByFamilyName -MainPackage Microsoft.DesktopAppInstaller_8wekyb3d8bbwe`.
-- Скачивание файла: `Invoke-WebRequest <url> -OutFile <путь> -UseBasicParsing`.
+- Скачивание файла: `[Net.ServicePointManager]::SecurityProtocol='Tls12'; Invoke-WebRequest <url> -OutFile <путь> -UseBasicParsing` (без Tls12 PowerShell 5.1 не скачивает со многих сайтов).
 - Проверка интернета: `Test-NetConnection 8.8.8.8 -Port 53 | Select-Object TcpTestSucceeded`.
 - Место на диске: `Get-PSDrive C | Select-Object Used, Free`.
 - Установленные программы: `Get-Package | Where-Object Name -like '*<имя>*' | Select-Object Name, Version`.
 - Процессы, которые грузят ПК: `Get-Process | Sort-Object CPU -Descending | Select-Object -First 10 Name, CPU, WorkingSet`.
+- sfc пишет вывод в UTF-16 — запускай так (консоль администратора, timeout 1800; фильтр убирает строки прогресса): `$e=[Console]::OutputEncoding; try { [Console]::OutputEncoding=[Text.Encoding]::Unicode; sfc /scannow | ? { $_ -notmatch '\d\s*%' } } finally { [Console]::OutputEncoding=$e }`. Итог не виден — смотри журнал: `(Select-String -Path $env:windir\Logs\CBS\CBS.log -Pattern '\[SR\]' | Select-Object -Last 20).Line`.

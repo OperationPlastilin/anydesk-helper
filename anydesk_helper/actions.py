@@ -28,19 +28,40 @@ NAMED_KEYS = {
     "pagedown", "capslock", "printscreen", "apps",
 } | {f"f{i}" for i in range(1, 13)}
 
+# Загрузка и запуск кода из сети. Уроки с таким решением агент не включает без проверки техником.
+REMOTE_CODE_PATTERNS = [
+    r"https?://", r"\b(iex|invoke-expression)\b", r"\[scriptblock\]::create",
+    r"\b(iwr|irm|curl|wget|invoke-webrequest|invoke-restmethod|start-bitstransfer|bitsadmin)\b",
+    r"download(string|file|data)\b", r"\bcertutil\b.*-urlcache", r"\b(mshta|regsvr32|rundll32)\b",
+    # powershell -e/-ec/-enc…/-EncodedCommand <base64> — только префиксы EncodedCommand, не -Encoding
+    r"\s-e(c|n(c(o(d(e(d(c\w*)?)?)?)?)?)?)?\s+[a-z0-9+/=]{16,}",
+]
 # Команды, которые всегда требуют подтверждения оператора в режиме confirm=risky.
+# Только чтение (Format-Table, ветка реестра ...\Uninstall, Get-InstalledModule, netsh … show) — без вопросов.
 DANGEROUS_PATTERNS = [
     r"\bremove-item\b", r"\brm\s", r"\bdel\s", r"\berase\b", r"\brd\s", r"\brmdir\b",
-    r"\bformat(-volume)?\b", r"\bdiskpart\b", r"\bbcdedit\b", r"\breg\s+(delete|add|import)\b",
+    r"\bformat-volume\b", r"(?<![-.\w])format(\.com)?\s+[a-z]:", r"\bdiskpart\b", r"\bbcdedit\b",
+    r"\breg\s+(delete|add|import)\b",
     r"\bshutdown\b", r"\brestart-computer\b", r"\bstop-computer\b", r"\bset-executionpolicy\b",
     r"\bcipher\b", r"\bclear-disk\b", r"\bremove-partition\b", r"\bnet\s+user\b",
-    r"\buninstall\b", r"\bremove-appxpackage\b", r"\bvssadmin\b", r"\bwmic\b.*\bdelete\b",
-    r"\bremove-localuser\b", r"\bdisable-", r"\bstop-service\b", r"\bsc\s+(delete|stop|config)\b",
-    r"\binstall", r"\bmsiexec\b", r"\bsetup\.exe\b", r"\bset-itemproperty\b",
-    r"\bnew-itemproperty\b", r"\bremove-", r"\bset-service\b", r"\bnetsh\b",
-    r"-verb\s+runas\b", r"\btakeown\b", r"\bicacls\b", r"\bset-mppreference\b",
+    r"(?<!currentversion\\)uninstall", r"\bremove-appxpackage\b", r"\bvssadmin\b", r"\bwmic\b.*\bdelete\b",
+    r"\bremove-localuser\b", r"\bdisable-", r"\bstop-service\b",
+    r"\bsc(\.exe)?\s+(create|delete|stop|config)\b",
+    r"\binstall(?!ed|date|location|source|state|time)",  # Install-Module, install_x64.exe, InstallUtil
+    r"\badd-appxpackage\b", r"\bmsiexec\b", r"\bsetup\.exe\b", r"\bset-itemproperty\b",
+    r"\bnew-itemproperty\b", r"\bremove-", r"\b(new|set)-service\b",
+    r"\bnetsh\b(?!\s+(?:[\w-]+\s+){0,3}show\b)", r"\bkey\s*=\s*clear\b",
+    r"-verb\s+runas\b", r"\btakeown\b", r"\bicacls\b", r"\b(add|set)-mppreference\b",
+    r"\b(stop-process|spps|kill|taskkill|tskill)\b",  # закрыть программы — пользователь потеряет работу
+    r"\bnet\s+localgroup\b.*/(add|delete)", r"\b(add|new|set)-local(user|group(member)?)\b",
+    r"\bschtasks\b.*/(create|change|delete)", r"\b(register|set|unregister)-scheduledtask\b",
+    r"\b(new|set)-netfirewall", r"\b(rename|add)-computer\b", r"\bclear-recyclebin\b",
+    *REMOTE_CODE_PATTERNS,
 ]
 DANGEROUS_HOTKEYS = [{"alt", "f4"}, {"ctrl", "alt", "delete"}, {"win", "l"}]
+# exit в начале оператора: обёртка выполняет команду в консоли пользователя (dot-source), и exit
+# закрыл бы её окно — результат не придёт никогда. «cmd /c exit 3», Exit-PSSession, $LASTEXITCODE — можно.
+EXIT_RE = re.compile(r"(?im)(?:^|[;{}(])\s*exit(?![\w-])|\[(?:system\.)?environment\]::exit\b")
 
 
 class ActionError(ValueError):
@@ -59,7 +80,7 @@ class Action:
     y2: float | None = None
     text: str = ""  # текст для type, вопрос, итог или причина неудачи
     command: str = ""
-    timeout: float = 120.0
+    timeout: float | None = None  # None — таймаут из настроек (command_timeout)
     keys: list[str] = field(default_factory=list)
     amount: int = 0
     seconds: float = 0.0
@@ -99,15 +120,30 @@ def extract_json(text: str) -> dict:
     """Достаёт первый JSON-объект из ответа модели (с ```json, <think> и мусором вокруг)."""
     if not text:
         raise ActionError("Empty reply")
-    text = re.sub(r"<think>.*?</think>", "", text, flags=re.S)
+    # Рассуждение — всё до последнего </think>: у Qwen3-Thinking/QwQ открывающий тег стоит в самом
+    # промте, и в ответе есть только закрывающий. Черновой JSON из рассуждения выполнять нельзя.
+    if "</think>" in text:
+        text = text.rsplit("</think>", 1)[1]
+    elif text.lstrip().startswith("<think>"):
+        raise ActionError("Reply was cut off inside <think> reasoning. Think briefly and answer "
+                          "with the JSON object")
     decoder = json.JSONDecoder()
+    error = None
     for match in re.finditer(r"\{", text):
         try:
-            obj, _ = decoder.raw_decode(text, match.start())
-        except json.JSONDecodeError:
+            obj, end = decoder.raw_decode(text, match.start())
+        except json.JSONDecodeError as e:
+            error = error or e
             continue
-        if isinstance(obj, dict):
-            return obj
+        if not isinstance(obj, dict) or not obj:
+            continue  # {} из текста вроде «screenshot {}» — не ответ
+        if error and text[end:].lstrip()[:1] in (",", "}"):
+            continue  # вложенный объект из испорченного внешнего — тоже не ответ
+        return obj
+    if error:
+        hint = (' In JSON strings write every backslash doubled ("C:\\\\Users") or use forward '
+                "slashes (C:/Users)." if "escape" in error.msg else "")
+        raise ActionError(f"Invalid JSON: {error.msg} at char {error.pos}.{hint}")
     raise ActionError("No valid JSON object found in the reply")
 
 
@@ -157,12 +193,41 @@ def normalize_keys(raw) -> list[str]:
     return keys
 
 
+WRAPPER_KEYS = ("parameters", "params", "args", "arguments", "action_input", "input")
+
+
+def _flatten(data: dict) -> dict:
+    """Qwen любит вкладывать параметры: {"action": {"type": "run", ...}}, {"action": "run",
+    "parameters": {...}}, {"name": "run", "arguments": "{...}"}. Поднимаем их наверх; ключи
+    верхнего уровня главнее (вложенный risky=false не отменит risky=true)."""
+    data = dict(data)
+    inner = data.get("action")
+    if isinstance(inner, dict):
+        data["action"] = inner.get("type") or inner.get("name") or inner.get("action") or ""
+        for k, v in inner.items():
+            data.setdefault(k, v)
+    name = str(data.get("action") or data.get("type") or data.get("name") or "")
+    for key in (*WRAPPER_KEYS, name):
+        value = data.get(key)
+        if key == "arguments" and isinstance(value, str):  # стиль function calling: JSON строкой
+            try:
+                value = json.loads(value)
+            except ValueError:
+                continue
+        if isinstance(value, dict):
+            for k, v in value.items():
+                data.setdefault(k, v)
+    return data
+
+
 def parse_action(data: dict, img_w: int = 0, img_h: int = 0, coords: str = "pixels") -> Action:
     """Проверяет JSON от модели. Координаты возвращаются в пикселях скриншота.
 
     img_w/img_h = 0 означает, что в этом шаге скриншота не было — GUI-клики запрещены.
     """
-    kind = str(data.get("action") or data.get("type") or "").strip().lower()
+    data = _flatten(data)
+    kind = str(data.get("action") or data.get("type") or data.get("name")
+               or ("run" if data.get("command") or data.get("cmd") else "")).strip().lower()
     kind = ALIASES.get(kind, kind)
     if kind not in ACTION_TYPES:
         raise ActionError(f"Unknown action {kind!r}. Allowed: {', '.join(ACTION_TYPES)}")
@@ -205,11 +270,14 @@ def parse_action(data: dict, img_w: int = 0, img_h: int = 0, coords: str = "pixe
     if kind == "run":
         a.command = str(data.get("command") or data.get("cmd") or "").strip()
         if not a.command:
-            raise ActionError("'command' is empty")
+            raise ActionError("'command' is empty: put \"command\" at the top level, next to \"action\"")
+        if EXIT_RE.search(a.command):
+            raise ActionError("Do not use exit: it closes the customer's PowerShell window. Use return "
+                              "to stop early or throw to report an error; use open_terminal for a fresh console.")
         if "timeout" in data:
             a.timeout = min(max(_number(data, "timeout"), 5.0), 1800.0)
     if kind == "wait":
-        a.seconds = min(max(_number(data, "seconds"), 1.0), 600.0)
+        a.seconds = min(max(_number(data, "seconds"), 1.0), 1800.0)
     if kind in ("ask_operator", "ask_enduser", "done", "fail"):
         key = {"done": "summary", "fail": "reason"}.get(kind, "question")
         a.text = str(data.get(key) or data.get("text") or "").strip()
@@ -221,6 +289,12 @@ def parse_action(data: dict, img_w: int = 0, img_h: int = 0, coords: str = "pixe
 def is_dangerous_text(text: str) -> bool:
     low = text.lower()
     return any(re.search(p, low) for p in DANGEROUS_PATTERNS)
+
+
+def is_remote_code(text: str) -> bool:
+    """Ссылка или загрузка/запуск кода из сети (irm … | iex, DownloadString, -enc …)."""
+    low = (text or "").lower()
+    return any(re.search(p, low) for p in REMOTE_CODE_PATTERNS)
 
 
 def needs_confirmation(action: Action, mode: str, last_typed: str = "") -> bool:

@@ -1,16 +1,20 @@
 """Локальный веб-интерфейс: тикеты, ход решения, вопросы ИИ, настройки, обновления.
 
-Безопасность: сервер слушает только 127.0.0.1. Каждый запрос к API должен нести токен,
-который вшивается в страницу при её выдаче, — чужой сайт, открытый в том же браузере,
-не сможет его прочитать и не отправит агенту команду. Проверка Host защищает от DNS rebinding.
+Безопасность: сервер слушает только 127.0.0.1. Каждый запрос к API должен нести токен
+(X-Token или ?t=). Страницу «/» тоже отдаём только по ссылке с токеном, которую открывает
+программа: loopback общий для всех пользователей Windows, а токен лежит в их личной папке
+данных. Чужой сайт в том же браузере токен не прочитает и не встроит интерфейс во фрейм
+(кликджекинг кнопки «Выполнить»). Проверка Host защищает от DNS rebinding.
 """
 
 from __future__ import annotations
 
 import secrets
+import threading
 from pathlib import Path
 
 from flask import Flask, Response, abort, jsonify, request, send_from_directory
+from werkzeug.exceptions import NotFound
 
 from . import updater
 from .agent import NO, STOP, YES
@@ -22,6 +26,12 @@ from .version import __version__
 
 ANSWERS = {"yes": YES, "no": NO, "stop": STOP}
 
+NO_TOKEN_PAGE = """<!doctype html><meta charset="utf-8"><title>AnyDesk Helper</title>
+<body style="font-family:system-ui,sans-serif;max-width:640px;margin:48px auto;padding:0 16px">
+<h2>Нужна ссылка с ключом доступа</h2>
+<p>Откройте интерфейс из программы: запустите AnyDeskHelper.exe ещё раз — она откроет браузер
+с правильной ссылкой. Ссылка с ключом (…/?t=…) также напечатана в окне программы.</p></body>"""
+
 
 def create_app(db, store, manager, port: int, dev: bool = False, token: str | None = None,
                kb=None) -> Flask:
@@ -32,25 +42,45 @@ def create_app(db, store, manager, port: int, dev: bool = False, token: str | No
     if not static.is_dir():
         static = Path(__file__).resolve().parent / "static"
     allowed_hosts = {f"127.0.0.1:{port}", f"localhost:{port}"}
-    update_state: dict = {"info": None, "error": ""}
+    # installing — скачивается обновление: после него процесс завершится, новый сеанс не начинаем.
+    update_state: dict = {"info": None, "error": "", "installing": False}
+    update_lock = threading.Lock()  # «запуск сеанса» и «начало обновления» не пересекаются
+
+    def token_ok() -> bool:
+        given = request.headers.get("X-Token") or request.args.get("t") or ""
+        return secrets.compare_digest(given.encode(), token.encode())
 
     @app.before_request
     def guard():
         if request.host not in allowed_hosts:
             abort(403)
-        if request.path.startswith("/api/") or request.path.startswith("/files/"):
-            given = request.headers.get("X-Token") or request.args.get("t")
-            if not given or not secrets.compare_digest(given, token):
-                abort(401)
+        if request.path == "/" and not token_ok():
+            return Response(NO_TOKEN_PAGE, 401, mimetype="text/html")
+        if request.path.startswith(("/api/", "/files/")) and not token_ok():
+            abort(401)
+
+    @app.after_request
+    def security_headers(resp):
+        resp.headers.setdefault("X-Frame-Options", "DENY")
+        resp.headers.setdefault("Content-Security-Policy", "frame-ancestors 'none'")
+        resp.headers.setdefault("Referrer-Policy", "no-referrer")  # токен из ?t= не уходит по ссылкам
+        return resp
 
     @app.errorhandler(ValueError)
     def bad_value(e):
         return jsonify(error=str(e)), 400
 
+    @app.errorhandler(404)
+    def not_found(e):
+        if not request.path.startswith("/api/"):
+            return e
+        custom = e.description != NotFound.description
+        return jsonify(error=e.description if custom else "Не найдено"), 404
+
     def ticket_or_404(tid: int) -> dict:
         t = db.get_ticket(tid)
         if not t:
-            abort(404)
+            abort(404, "Тикет не найден")
         return t
 
     def body() -> dict:
@@ -106,6 +136,7 @@ def create_app(db, store, manager, port: int, dev: bool = False, token: str | No
         if manager.get(tid):
             raise ValueError("Сначала остановите сеанс")
         db.delete_ticket(tid)
+        manager.delete_files(tid)  # и скриншоты экрана пользователя
         return jsonify(ok=True)
 
     @app.get("/api/tickets/<int:tid>/events")
@@ -135,11 +166,15 @@ def create_app(db, store, manager, port: int, dev: bool = False, token: str | No
         s = store.load()
         if not s.api_key and "openrouter" in s.base_url:
             raise ValueError("Не задан API-ключ модели (Настройки)")
-        try:
-            manager.start(tid, password=str(b.get("password", "")), connect=bool(b.get("connect", True)),
-                          mode=mode, dry_run=bool(dev and b.get("dry_run")))
-        except RuntimeError as e:
-            raise ValueError(str(e)) from None
+        with update_lock:
+            if update_state["installing"]:
+                raise ValueError("Идёт обновление программы — дождитесь перезапуска")
+            try:
+                manager.start(tid, password=str(b.get("password", "")), connect=bool(b.get("connect", True)),
+                              mode=mode, dry_run=bool(dev and b.get("dry_run")),
+                              resume=bool(b.get("resume") and t["plan"]))
+            except RuntimeError as e:
+                raise ValueError(str(e)) from None
         return jsonify(ok=True)
 
     @app.post("/api/tickets/<int:tid>/answer")
@@ -210,7 +245,7 @@ def create_app(db, store, manager, port: int, dev: bool = False, token: str | No
 
     def need_kb():
         if kb is None:
-            abort(404)
+            abort(404, "База опыта недоступна")
         return kb
 
     @app.get("/api/knowledge")
@@ -220,14 +255,16 @@ def create_app(db, store, manager, port: int, dev: bool = False, token: str | No
     @app.post("/api/knowledge")
     def knowledge_add():
         b = body()
+        # Урок, введённый техником, — всегда отдельной записью, не сливаем с похожим.
         lesson = need_kb().add(str(b.get("kind", "manual")), str(b.get("title", "")),
-                               str(b.get("problem", "")), str(b.get("solution", "")), b.get("tags", ""))
+                               str(b.get("problem", "")), str(b.get("solution", "")), b.get("tags", ""),
+                               dedup=False)
         return jsonify(lesson), 201
 
     @app.patch("/api/knowledge/<int:lid>")
     def knowledge_edit(lid):
         if not need_kb().get(lid):
-            abort(404)
+            abort(404, "Урок не найден")
         return jsonify(kb.update(lid, **body()))
 
     @app.delete("/api/knowledge/<int:lid>")
@@ -252,11 +289,14 @@ def create_app(db, store, manager, port: int, dev: bool = False, token: str | No
     @app.get("/api/state")
     def state():
         cur = manager.current if manager.current and manager.current.alive else None
+        p = cur.pending if cur else None  # читаем один раз: поток сеанса может сбросить его
         s = store.load()
         counts = db.status_counts()
         return jsonify(version=__version__, active_ticket=cur.tid if cur else None,
                        active_status=db.get_ticket(cur.tid)["status"] if cur else None,
+                       active_ask={"id": p["id"], "kind": p["kind"], "text": p["text"][:200]} if p else None,
                        update=update_state["info"], update_error=update_state["error"],
+                       installing=update_state["installing"],
                        frozen=updater.can_self_update(), counts=counts,
                        knowledge=kb.stats() if kb else None,
                        model={"name": s.model, "provider": s.provider, "key": bool(s.api_key),
@@ -273,15 +313,25 @@ def create_app(db, store, manager, port: int, dev: bool = False, token: str | No
 
     @app.post("/api/update/install")
     def update_install():
-        if manager.current and manager.current.alive:
-            raise ValueError("Дождитесь окончания сеанса")
-        info = update_state["info"] or updater.check(__version__)
-        if not info:
-            raise ValueError("Обновлений нет")
+        with update_lock:
+            if update_state["installing"]:
+                raise ValueError("Обновление уже скачивается")
+            if manager.current and manager.current.alive:
+                raise ValueError("Дождитесь окончания сеанса")
+            update_state["installing"] = True
+        # Новая версия поднимется на том же порту (его опрашивает открытая вкладка) и в том же режиме.
+        restart = ["--no-browser", "--port", str(port)] + (["--dev"] if dev else [])
         try:
-            updater.install(info, restart_args=["--no-browser"])
+            info = update_state["info"] or updater.check(__version__)
+            if not info:
+                raise ValueError("Обновлений нет")
+            updater.install(info, restart_args=restart)
         except updater.UpdateError as e:
+            update_state["installing"] = False
             raise ValueError(str(e)) from None
+        except BaseException:
+            update_state["installing"] = False
+            raise
         return jsonify(ok=True, message="Обновление установлено, программа перезапускается")
 
     app.config["UPDATE_STATE"] = update_state

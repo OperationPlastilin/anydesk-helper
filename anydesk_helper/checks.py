@@ -9,11 +9,19 @@ from .llm import LLMError, user_message
 from .screen import Frame, Region
 
 
+def _not_cut(llm) -> None:
+    """Обрезанный по max_tokens ответ мог кончиться черновым JSON из рассуждений — это не успех."""
+    if getattr(llm, "finish_reason", "") == "length":
+        raise ActionError("ответ обрезан по max_tokens — увеличьте max_tokens в настройках "
+                          "или выберите модель без thinking")
+
+
 def check_model(llm, settings) -> tuple[bool, list[str]]:
     report = [f"Модель: {settings.model} ({settings.base_url})"]
     try:
         reply = llm.chat([{"role": "user", "content":
                            'Reply with JSON only: {"status": "ok", "language": "<your name>"}'}])
+        _not_cut(llm)
         extract_json(reply)
         report.append("✔ Модель отвечает и соблюдает формат JSON")
     except (LLMError, ActionError) as e:
@@ -31,7 +39,9 @@ def check_model(llm, settings) -> tuple[bool, list[str]]:
     question = ("Where is the center of the red square? Reply with JSON only: "
                 f'{{"x": .., "y": ..}} (coordinates in {unit}).')
     try:
-        data = extract_json(llm.chat([user_message(question, frame.to_data_url())]))
+        reply = llm.chat([user_message(question, frame.to_data_url())])
+        _not_cut(llm)
+        data = extract_json(reply)
         x, y = float(data["x"]), float(data["y"])
     except (LLMError, ActionError, KeyError, TypeError, ValueError) as e:
         report.append(f"✘ Картинки: модель не ответила координатами ({e}). Если модель не "

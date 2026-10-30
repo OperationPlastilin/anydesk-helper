@@ -3,14 +3,17 @@
 from __future__ import annotations
 
 import itertools
+import os
 import queue
+import shutil
+import sys
 import threading
 import time
 import traceback
 from pathlib import Path
 
 from . import anydesk
-from .agent import NO, STOP, YES, Agent, StopSession
+from .agent import NO, STOP, YES, Agent, StopSession, restore_state
 from .bridge import ConsoleBridge
 from .controller import Controller
 from .llm import LLM
@@ -23,7 +26,7 @@ class Session:
     _ids = itertools.count(1)
 
     def __init__(self, manager, ticket: dict, password: str = "", connect: bool = True,
-                 mode: str = "anydesk", dry_run: bool = False):
+                 mode: str = "anydesk", dry_run: bool = False, resume: bool = False):
         self.m = manager
         self.ticket = ticket
         self.tid = ticket["id"]
@@ -31,6 +34,8 @@ class Session:
         self.connect = connect
         self.mode = mode
         self.dry_run = dry_run
+        # продолжить по сохранённому плану, а не начинать заново (resume() — снятие с паузы)
+        self.resume_requested = resume
         self.pending: dict | None = None
         self._answers: queue.Queue = queue.Queue()
         self.paused = False
@@ -51,9 +56,14 @@ class Session:
 
     def ask(self, kind: str, text: str, **data) -> str:
         pid = next(self._ids)
-        self.pending = {"id": pid, "kind": kind, "text": text, "data": data}
-        self.event("ask", text, ask_kind=kind, ask_id=pid, **data)
+        # Порядок важен: статус и событие — до публикации вопроса. Иначе веб видит вопрос при старом
+        # статусе, техник успевает ответить, и статус потом «перескакивает» обратно на «ждёт ответа».
         self.status("waiting")
+        self.event("ask", text, ask_kind=kind, ask_id=pid, **data)
+        self.pending = {"id": pid, "kind": kind, "text": text, "data": data}
+        # Звук слышен, даже если вкладка браузера закрыта. В отдельном потоке: MessageBeep без
+        # звуковой карты (RDP, сервер) может надолго зависнуть, а ответ техника ждать не должен.
+        threading.Thread(target=_safe_call, args=(self.m.alert,), name="alert", daemon=True).start()
         try:
             while True:
                 if self.stopping:
@@ -119,6 +129,8 @@ class Session:
         self.event("info", "Продолжение работы")
 
     def stop(self) -> None:
+        if not self.stopping:
+            self.event("info", "Останавливаю сеанс…")
         self.stopping = True
         self.paused = False
 
@@ -138,18 +150,24 @@ class Session:
             agent = Agent(settings, parts["llm"], parts["target"], parts["controller"],
                           parts["bridge"], self, self.ticket, playbook_dirs=self.m.playbook_dirs,
                           grab=parts.get("grab") or _default_grab(), sleep=self.sleep, kb=self.m.kb)
-            ok = agent.run()
+            saved = restore_state(self.m.db.events(self.tid)) if self.resume_requested else None
+            ok = agent.run(saved)
             result_status = "solved" if ok else "failed"
         except StopSession:
             result_status = "stopped"
             self.event("status", "Сеанс остановлен техником")
         except Exception as e:  # сеанс не должен ронять программу
-            self.event("error", f"Ошибка: {e}", traceback=traceback.format_exc())
+            if type(e).__name__ == "FailSafeException":  # pyautogui: мышь в углу — аварийная остановка
+                result_status = "stopped"
+                self.event("status", "Аварийная остановка: мышь в углу экрана")
+            else:
+                self.event("error", f"Ошибка: {e}", traceback=traceback.format_exc())
         finally:
             if self.m.kb:
                 self.m.kb.mark_outcome(self.tid, result_status == "solved")
-            # Самообучение: разбираем сеанс и запоминаем уроки (кроме остановленных вручную).
-            if agent and settings.learning and result_status in ("solved", "failed"):
+            # Самообучение: разбираем сеанс и запоминаем уроки (кроме остановленных вручную:
+            # после «Стопа» модель больше не вызываем).
+            if agent and settings.learning and not self.stopping and result_status in ("solved", "failed"):
                 try:
                     self.event("info", "Агент разбирает сеанс и записывает уроки в базу опыта…")
                     agent.learn(result_status)
@@ -183,14 +201,39 @@ def _default_grab():
 def default_factory(session: Session) -> dict:
     """Собирает «железо» сеанса: окно AnyDesk, мышь/клавиатуру, консольный мост, модель."""
     s = session.m.settings()
+    local_name = None
     if session.mode == "local":
         target = anydesk.ScreenTarget()
         session.event("warning", "Режим проверки: агент управляет ЭТИМ компьютером")
     else:
         target = find_target(session, s)
-    controller = Controller(dry_run=session.dry_run)
-    bridge = ConsoleBridge(controller, target, interrupted=lambda: session.stopping)
-    return {"llm": LLM(s), "target": target, "controller": controller, "bridge": bridge}
+        # Имя ПК техника: если ввод всё же попадёт в его консоль, обёртка команду не выполнит.
+        local_name = os.environ.get("COMPUTERNAME")
+    controller = Controller(dry_run=session.dry_run, target=target)
+    bridge = ConsoleBridge(controller, target, interrupted=lambda: session.stopping, local_name=local_name)
+    llm = LLM(s)
+    llm.should_stop = lambda: session.stopping  # «Стоп» прерывает повторы запроса и паузы между ними
+    llm.notify = lambda text: session.event("warning", text)  # смена на запасную модель, рост max_tokens
+    return {"llm": llm, "target": target, "controller": controller, "bridge": bridge}
+
+
+def _safe_call(fn) -> None:
+    try:
+        fn()
+    except Exception:
+        pass  # сигнал не должен ронять сеанс
+
+
+def beep() -> None:
+    """Сигнал «ИИ ждёт ответа» (только Windows)."""
+    if sys.platform != "win32":
+        return
+    try:
+        import winsound
+
+        winsound.MessageBeep(winsound.MB_ICONQUESTION)
+    except Exception:
+        pass
 
 
 def find_target(session: Session, s):
@@ -203,10 +246,12 @@ def find_target(session: Session, s):
         except FileNotFoundError:
             session.event("info", "AnyDesk не найден — скачиваю с официального сайта")
             exe = anydesk.download(session.m.data_dir / "anydesk")
+        if session.stopping:
+            raise StopSession
         session.event("info", f"Подключаюсь к {address}. Ждём, пока пользователь примет подключение…")
         anydesk.connect(exe, address, session.password or None)
     timeout = s.connect_timeout if session.connect else 5
-    window = anydesk.wait_for_session(address, timeout, s.window_title)
+    window = wait_window(session, address, timeout, s.window_title)
     while not window:
         answer = session.ask("pick_window", "Окно сеанса AnyDesk не найдено автоматически. Нажмите "
                              "«Выбрать окно», затем в течение 5 секунд кликните по окну сеанса AnyDesk.")
@@ -219,6 +264,20 @@ def find_target(session: Session, s):
     return anydesk.WindowTarget(window)
 
 
+def wait_window(session: Session, address: str, timeout: float, title_hint: str = ""):
+    """Ждёт окно сеанса AnyDesk (проверка раз в 2 с), но «Стоп» прерывает ожидание сразу."""
+    polls = int(timeout // 2) + 1
+    for i in range(polls):
+        if session.stopping:
+            raise StopSession
+        window = anydesk.find_session_window(address, title_hint)
+        if window:
+            return window
+        if i + 1 < polls:
+            session.sleep(2)
+    return None
+
+
 class SessionManager:
     """Один активный сеанс за раз: мышь и клавиатура у компьютера одни."""
 
@@ -229,9 +288,39 @@ class SessionManager:
         self.data_dir = Path(data_dir)
         self.files_dir = self.data_dir / "files"
         self.files_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            self.cleanup_files(self.settings().keep_files_days)
+        except OSError:
+            pass  # уборка не должна мешать запуску программы
         self.playbook_dirs = [self.data_dir / "playbooks", resource_dir() / "playbooks"]
         self.factory = factory
+        self.alert = beep  # вызывается при каждом вопросе технику; в тестах подменяется
         self.current: Session | None = None
+
+    def cleanup_files(self, days: int, now: float | None = None) -> int:
+        """Удаляет скриншоты старше days дней (0 — хранить вечно). Возвращает число удалённых."""
+        if days <= 0:
+            return 0
+        limit = (now or time.time()) - days * 86400
+        removed = 0
+        for path in self.files_dir.glob("*/*.jpg"):
+            try:
+                if path.stat().st_mtime < limit:
+                    path.unlink()
+                    removed += 1
+            except OSError:
+                continue
+        for folder in self.files_dir.iterdir():
+            try:
+                if folder.is_dir() and not any(folder.iterdir()):
+                    folder.rmdir()
+            except OSError:
+                continue  # папка занята (открыта консоль, антивирус) — удалим в следующий раз
+        return removed
+
+    def delete_files(self, ticket_id: int) -> None:
+        """Скриншоты удалённого тикета: на них экран пользователя."""
+        shutil.rmtree(self.files_dir / str(int(ticket_id)), ignore_errors=True)
 
     def settings(self):
         return self.store.load()
