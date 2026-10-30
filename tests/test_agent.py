@@ -82,6 +82,7 @@ def test_console_not_answering_triggers_screenshot():
         {"summary": "", "questions": [], "plan": ["x"]},
         {"action": "fail", "reason": "консоль не отвечает"},
     ]
-    agent, llm, op, remote = make_agent(replies, [YES, NO], silent=True)
+    # NO на вопрос «откройте PowerShell вручную» — продолжить без консоли, по скриншоту
+    agent, llm, op, remote = make_agent(replies, [NO, YES, NO], silent=True)
     assert agent.run() is False
     assert "NO RESPONSE" in llm.requests[1][1]["content"][0]["text"]  # и скриншот приложен

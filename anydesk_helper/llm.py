@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import re
+import threading
 import time
 from datetime import datetime
 
@@ -25,6 +27,7 @@ class LLM:
         self.sleep = sleep
         self.should_stop = lambda: False  # сеанс подставляет «нажат Стоп»
         self.notify = lambda text: None  # сеанс может показать технику смену модели или max_tokens
+        self.on_model_change = lambda model: None  # сеанс сохраняет новую модель в настройки
         self.finish_reason = ""  # причина конца последнего ответа ("length" — обрезан по max_tokens)
 
     def _headers(self) -> dict:
@@ -48,11 +51,66 @@ class LLM:
             seconds -= 0.5
         self._check_stop()
 
+    def _post(self, payload: dict):
+        """POST в отдельном потоке: «Стоп» прерывает ожидание сразу, а не через timeout (до 2 мин)."""
+        box: dict = {}
+
+        def run():
+            try:
+                box["resp"] = self.http.post(self.base + "/chat/completions", json=payload,
+                                             headers=self._headers(), timeout=(15, self.s.timeout))
+            except BaseException as e:  # noqa: BLE001 — передаём в вызывающий поток как есть
+                box["error"] = e
+
+        worker = threading.Thread(target=run, name="llm-request", daemon=True)
+        worker.start()
+        while worker.is_alive():
+            worker.join(0.25)
+            self._check_stop()  # запрос дорабатывает в фоне, его ответ просто не нужен
+        if "error" in box:
+            raise box["error"]
+        return box["resp"]
+
+    def pick_model(self, exclude=()) -> str:
+        """Лучшая доступная модель провайдера: бесплатная Qwen с картинками, если нужны скриншоты.
+        Бесплатные модели на OpenRouter то появляются, то исчезают — поэтому выбираем на лету."""
+        models = [m for m in self.list_models() if m["id"] not in exclude]
+        vision = bool(getattr(self.s, "vision", True))
+        known_prices = any(m.get("priced") for m in models)
+
+        def rank(m):
+            qwen = "qwen" in m["id"].lower()
+            return (not m["free"] if known_prices else False, vision and not m["vision"], not qwen,
+                    "thinking" in m["id"].lower(), m["id"])
+
+        candidates = [m for m in models if m["free"] or not known_prices]
+        if not candidates:
+            raise LLMError("У провайдера нет бесплатных моделей — укажите модель вручную в Настройках")
+        return min(candidates, key=rank)["id"]
+
+    def _switch_model(self, reason: str, tried: set) -> bool:
+        """Модель недоступна: берём запасную из настроек или подбираем сами. False — менять не на что."""
+        tried.add(self.model)
+        fallback = (getattr(self.s, "fallback_model", "") or "").strip()
+        try:
+            new = fallback if fallback and fallback not in tried else self.pick_model(exclude=tried)
+        except LLMError:
+            return False
+        self.notify(f"Модель {self.model} недоступна ({reason}) — переключаюсь на {new}")
+        self.model = new
+        self.on_model_change(new)
+        return True
+
     def chat(self, messages: list[dict]) -> str:
         if not self.base:
             raise LLMError("Не указан адрес API (Настройки -> Модель)")
+        if not self.model or self.model.lower() == AUTO:
+            self.model = self.pick_model()
+            self.notify(f"Автовыбор модели: {self.model}")
+            self.on_model_change(self.model)
         payload = {"messages": messages, "temperature": self.s.temperature}
         last_error = ""
+        tried: set = set()
         for attempt in range(4):
             self._check_stop()
             payload.update(model=self.model, max_tokens=self.max_tokens)
@@ -62,8 +120,7 @@ class LLM:
                 payload.pop("response_format", None)
             wait = 5 * (attempt + 1)
             try:
-                resp = self.http.post(self.base + "/chat/completions", json=payload,
-                                      headers=self._headers(), timeout=(15, self.s.timeout))
+                resp = self._post(payload)
             except requests.RequestException as e:
                 if isinstance(e, ValueError):  # MissingSchema, InvalidURL…: повтор не поможет
                     raise LLMError(f"Неверный адрес API {self.base} — он должен начинаться "
@@ -95,6 +152,10 @@ class LLM:
                     continue
                 if resp.status_code in (401, 403):
                     raise LLMError(f"Неверный или пустой API-ключ ({last_error})")
+                if resp.status_code in (400, 404) and MODEL_GONE_RE.search(resp.text) and len(tried) < 3:
+                    # «This model is unavailable for free», «No endpoints found for …» и т.п.
+                    if self._switch_model(f"HTTP {resp.status_code}", tried):
+                        continue
                 if resp.status_code == 429:
                     daily, delay, reset = self._rate_limit(resp)
                     fallback = (getattr(self.s, "fallback_model", "") or "").strip()
@@ -180,6 +241,7 @@ class LLM:
             pricing = m.get("pricing") or {}
             models.append({
                 "id": mid,
+                "priced": bool(pricing),  # провайдер сообщает цены (OpenRouter) — значит, «free» достоверен
                 "vision": "image" in modalities or "vl" in mid.lower(),
                 # Цены не пришли (DashScope, свой сервер) — значит, неизвестно, а не «бесплатно».
                 "free": mid.endswith(":free") or bool(pricing) and all(
@@ -187,6 +249,11 @@ class LLM:
             })
         models.sort(key=lambda m: ("qwen" not in m["id"].lower(), not m["vision"], not m["free"], m["id"]))
         return models
+
+
+AUTO = "auto"  # модель выбирается автоматически при первом запросе
+MODEL_GONE_RE = re.compile(r"unavailable for free|no endpoints found|not a valid model|model[_ ]not[_ ]found|"
+                           r"does not exist|is not available|model .{0,80}not found|deprecated", re.I)
 
 
 def _zero(value) -> bool:

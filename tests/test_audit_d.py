@@ -48,7 +48,7 @@ class Http:
 
 
 def make(*responses, **settings):
-    s = Settings(api_key="k")
+    s = Settings(api_key="k", model="qwen/test-model")  # автовыбор (model="auto") — в test_model_auto.py
     for key, value in settings.items():
         setattr(s, key, value)
     clock = Clock()
@@ -91,7 +91,7 @@ def test_daily_limit_switches_to_fallback_model():
     notes = []
     llm.notify = notes.append
     assert llm.chat([]) == "ответ" and clock.t == 0
-    assert [p["model"] for p in http.posts] == [Settings().model, "qwen/qwen-plus"]
+    assert [p["model"] for p in http.posts] == ["qwen/test-model", "qwen/qwen-plus"]
     assert notes and "qwen/qwen-plus" in notes[0]
 
 
